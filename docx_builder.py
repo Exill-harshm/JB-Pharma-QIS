@@ -29,6 +29,198 @@ MANUAL_ENTRY_SECTIONS = {'1.2', '1.3', '1.4', '1.5', '1.5.1', '1.5.2', '1.6'}
 _PAGE_NUM_RE = re.compile(r'^\d{1,4}$')
 _PAGE_OF_RE  = re.compile(r'^\d+\s+of\s+\d+\s*$', re.IGNORECASE)
 
+def _remove_noise_tables(doc, logger) -> int:
+    body = doc.element.body
+    _NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+
+    def _wt(elem):
+        return ''.join(t.text or '' for t in elem.iter(f'{{{_NS}}}t')).strip()
+
+    # All paragraph texts — used to detect 1x1 header tables
+    all_para_texts = {p.text.strip() for p in doc.paragraphs if p.text.strip()}
+
+    def _is_noise(elem):
+        text = _wt(elem)
+        clean = re.sub(r'\s+', '', text)
+        rows = len(elem.findall(f'.//{{{_NS}}}tr'))
+        cols = len(elem.findall(f'{{{_NS}}}tr/{{{_NS}}}tc'))
+        if not clean:                                                   return True  # empty
+        if re.match(r'^\d{1,4}$', text):                               return True  # "42"
+        if re.match(r'^\d+\s+of\s+\d+$', text, re.I):                 return True  # "3 of 6"
+        if len(text) < 90 and re.match(r'^.{5,75}\s+\d{1,4}$', text): return True  # "Co. 52"
+        if rows == 1 and cols == 1 and len(text) < 100 and text in all_para_texts:
+            return True  # 1x1 header table duplicated from a paragraph
+        # DMF page-header tables ("Drug Mater File Version: 3.1...")
+        if rows <= 4 and 'Drug Mater File' in text:
+            return True
+        # PDF section-header tables ("3.2.P PARTICULARS OF FINSHED...")
+        if rows <= 3 and 'PARTICULARS' in text:
+            return True
+        return False
+
+    to_remove = [e for e in list(body) if e.tag.split('}')[-1] == 'tbl' and _is_noise(e)]
+    for elem in to_remove:
+        body.remove(elem)
+    if to_remove:
+        logger.info(f"Removed {len(to_remove)} noise table(s).")
+    return len(to_remove)
+
+
+def _collapse_blank_paragraphs(doc, logger) -> int:
+    """Collapses runs of consecutive blank paragraphs down to at most one."""
+    body = doc.element.body
+    _NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    consecutive, to_remove = 0, []
+    for elem in list(body):
+        tag = elem.tag.split('}')[-1]
+        if tag == 'p':
+            text = ''.join(t.text or '' for t in elem.iter(f'{{{_NS}}}t')).strip()
+            if not text:
+                consecutive += 1
+                if consecutive > 1:
+                    to_remove.append(elem)
+            else:
+                consecutive = 0
+        else:
+            consecutive = 0
+    for elem in to_remove:
+        parent = elem.getparent()
+        if parent is not None:
+            parent.remove(elem)
+    if to_remove:
+        logger.info(f"Removed {len(to_remove)} excess blank paragraph(s).")
+    return len(to_remove)
+
+def _fix_zero_width_tables(doc, logger) -> int:
+    """Fixes tables injected by pdf2docx with tblW=0 — they render as blank boxes."""
+    _NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    PAGE_WIDTH_DXA = '9026'  # A4 with standard margins
+    fixed = 0
+    for elem in doc.element.body:
+        if elem.tag.split('}')[-1] != 'tbl':
+            continue
+        tblPr = elem.find(f'{{{_NS}}}tblPr')
+        if tblPr is None:
+            continue
+        tblW = tblPr.find(f'{{{_NS}}}tblW')
+        if tblW is not None and tblW.get(f'{{{_NS}}}w', '') == '0':
+            tblW.set(f'{{{_NS}}}w', PAGE_WIDTH_DXA)
+            tblW.set(f'{{{_NS}}}type', 'dxa')
+            fixed += 1
+    if fixed:
+        logger.info(f"Fixed {fixed} zero-width table(s).")
+    return fixed
+
+def _remove_repeated_header_paragraphs(doc, logger) -> int:
+    """
+    Removes PDF page-header paragraphs injected repeatedly by pdf2docx.
+    Detection is fully automatic: any paragraph text that appears 3+ times
+    AND is under 120 chars is treated as a repeating noise header.
+    """
+    from collections import Counter
+    _NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+
+    freq = Counter(p.text.strip() for p in doc.paragraphs if p.text.strip())
+    noise = {t for t, c in freq.items() if c >= 3 and len(t) < 120}
+
+    removed = 0
+    for elem in list(doc.element.body):
+        if elem.tag.split('}')[-1] != 'p':
+            continue
+        text = ''.join(t.text or '' for t in elem.iter(f'{{{_NS}}}t')).strip()
+        if text in noise:
+            elem.getparent().remove(elem)
+            removed += 1
+
+    if removed:
+        logger.info(f"Removed {removed} repeated header paragraph(s).")
+    return removed
+
+def _remove_pdf_noise_paragraphs(doc, logger) -> int:
+    """Removes PDF-injected noise paragraphs not caught by frequency filter."""
+    _NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    body = doc.element.body
+    elements = list(body)
+
+    def _wt(e):
+        return ''.join(t.text or '' for t in e.iter(f'{{{_NS}}}t')).strip()
+
+    removed = 0
+    for i, elem in enumerate(elements):
+        if elem.tag.split('}')[-1] != 'p':
+            continue
+        text = _wt(elem)
+        if not text:
+            continue
+
+        drop = False
+        # 1. Company name + bare page number  e.g. "Starry Co. Ltd 230"
+        if re.match(r'^.{10,75}\s+\d{1,4}$', text) and len(text) < 80:
+            drop = True
+        # 2. PDF section heading (3.2.X format) when template heading (2.3.X) exists nearby above
+        elif re.search(r'3\.2[\. ][A-Z0-9P]', text) and len(text) < 200:
+            for j in range(max(0, i - 10), i):
+                if re.search(r'2\.3\.[SP]', _wt(elements[j])):
+                    drop = True
+                    break
+        # 3. OCR artifacts and known single-occurrence PDF header lines
+        elif text in {'FINIHSED PRODUCT SPECIFICATION Product name', 'C~CkedBY:'}:
+            drop = True
+
+        if drop:
+            elem.getparent().remove(elem)
+            removed += 1
+
+    if removed:
+        logger.info(f"Removed {removed} PDF noise paragraph(s).")
+    return removed
+
+def _remove_empty_visual_tables(doc, logger) -> int:
+    """
+    Removes tables that have:
+    - no meaningful text
+    - mostly empty cells
+    - created from vector drawings (pdf2docx artifacts)
+    """
+    _NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    removed = 0
+
+    def get_text(cell):
+        return ''.join(
+            t.text or '' for t in cell._element.iter(f'{{{_NS}}}t')
+        ).strip()
+
+    for table in list(doc.tables):
+        total_cells = 0
+        empty_cells = 0
+        text_cells = 0
+
+        for row in table.rows:
+            for cell in row.cells:
+                total_cells += 1
+                text = get_text(cell)
+
+                if not text:
+                    empty_cells += 1
+                else:
+                    text_cells += 1
+
+        # KEY LOGIC
+        if total_cells > 4 and text_cells == 0:
+            # completely empty table → remove
+            table._element.getparent().remove(table._element)
+            removed += 1
+
+        elif total_cells > 6 and (empty_cells / total_cells) > 0.8:
+            # mostly empty → also remove
+            table._element.getparent().remove(table._element)
+            removed += 1
+
+    if removed:
+        logger.info(f"Removed {removed} empty visual table(s).")
+
+    return removed
+
 
 def _is_noise_paragraph(text: str, blocklist: Set[str]) -> bool:
     """
@@ -338,6 +530,14 @@ def process_template(
 
     logger.info(f"Saving output to {output_path}")
     try:
+        _remove_noise_tables(doc, logger)
+        _remove_empty_visual_tables(doc, logger) 
+        _fix_zero_width_tables(doc, logger)
+        _remove_repeated_header_paragraphs(doc, logger)
+        _remove_pdf_noise_paragraphs(doc, logger)
+        _collapse_blank_paragraphs(doc, logger)
+
+        logger.info(f"Saving output to {output_path}")
         doc.save(output_path)
     except Exception as e:
         logger.error(f"Failed to save: {e}")
