@@ -8,12 +8,18 @@ import fitz
 from .models import ApiInfo, ManufactureInfo, P31ManufacturerInfo, SummaryInfo
 
 
+BODY_CLIP_TOP_RATIO = 0.10
+BODY_CLIP_BOTTOM_RATIO = 0.92
+
+
 class ApiInfoExtractor:
     def extract_summary_info(self, pdf_path: Path) -> SummaryInfo:
         doc = fitz.open(pdf_path)
         try:
-            pages = [doc.load_page(i).get_text("text", sort=True) for i in range(doc.page_count)]
-            q_page = self._find_page_index(pages, "1.4.2 THE QUALITY INFORMATION SUMMARY (QIS)")
+            pages = [self._read_page_text(doc.load_page(i)) for i in range(doc.page_count)]
+            q_page = self._find_summary_page_index(pages)
+            if q_page is None:
+                q_page = self._find_page_index(pages, "1.4.2 THE QUALITY INFORMATION SUMMARY (QIS)")
             if q_page is None:
                 q_page = self._find_page_index(pages, "QUALITY INFORMATION SUMMARY (QIS)")
             if q_page is None:
@@ -24,7 +30,8 @@ class ApiInfoExtractor:
 
             for page_index in range(q_page, min(q_page + 2, doc.page_count)):
                 page = doc.load_page(page_index)
-                tables = page.find_tables().tables
+                clip_rect = self._body_clip_rect(page)
+                tables = page.find_tables(clip=clip_rect).tables
                 for table in tables:
                     rows = table.extract()
                     if not rows:
@@ -157,16 +164,55 @@ class ApiInfoExtractor:
         try:
             pages: list[str] = []
             for i in range(doc.page_count):
-                pages.append(doc.load_page(i).get_text("text", sort=True))
+                pages.append(ApiInfoExtractor._read_page_text(doc.load_page(i)))
             return "\n".join(pages)
         finally:
             doc.close()
+
+    @staticmethod
+    def _body_clip_rect(page: fitz.Page) -> fitz.Rect:
+        rect = page.rect
+        h = float(rect.height)
+        top = h * BODY_CLIP_TOP_RATIO
+        bottom = h * BODY_CLIP_BOTTOM_RATIO
+        return fitz.Rect(rect.x0, rect.y0 + top, rect.x1, rect.y0 + bottom)
+
+    @staticmethod
+    def _read_page_text(page: fitz.Page) -> str:
+        return page.get_text("text", sort=True, clip=ApiInfoExtractor._body_clip_rect(page))
 
     @staticmethod
     def _find_page_index(pages: list[str], needle: str) -> int | None:
         for index, page_text in enumerate(pages):
             if needle.lower() in page_text.lower():
                 return index
+        return None
+
+    @staticmethod
+    def _find_summary_page_index(pages: list[str]) -> int | None:
+        best_index: int | None = None
+        best_score = 0
+
+        for index, page_text in enumerate(pages):
+            lower = page_text.lower()
+            score = 0
+
+            if "quality information summary" in lower:
+                score += 2
+            if re.search(r"\b1\.4\.2\b", lower):
+                score += 2
+            if "summary of product information" in lower:
+                score += 3
+            if "administrative summary" in lower:
+                score += 1
+
+            if score > best_score:
+                best_score = score
+                best_index = index
+
+        # Minimum confidence avoids selecting a TOC mention-only page.
+        if best_score >= 5:
+            return best_index
         return None
 
     @staticmethod

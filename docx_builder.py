@@ -1,20 +1,17 @@
 """
 Module: docx_builder
 Responsibility: Opens QIS template DOCX, finds all "Refer Section X.X.X"
-placeholders, injects extracted PDF content (text + tables + images),
+placeholders, injects extracted PDF content (text + tables),
 cleans injected noise (headers/footers/page numbers), saves output DOCX.
 
 Noise detection is fully automatic — no hardcoded company names.
 The auto-detected blocklist comes from pdf_extractor._build_noise_blocklist().
 """
-import io
 import re
 import copy
 import os
 import docx
-from docx.shared import RGBColor, Inches
-from docx.oxml.ns import qn
-from docx.oxml import OxmlElement
+from docx.shared import RGBColor
 from typing import Dict, Set
 from logger_setup import get_logger
 
@@ -222,6 +219,56 @@ def _remove_empty_visual_tables(doc, logger) -> int:
     return removed
 
 
+def _remove_low_content_injected_tables(doc, logger, keep_first_n_tables: int) -> int:
+    """
+    Removes low-value injected tables while preserving original template tables.
+    This targets pdf2docx line-art table artifacts that appear as random lines.
+    """
+    _NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    removed = 0
+
+    def get_text(cell):
+        return ''.join(
+            t.text or '' for t in cell._element.iter(f'{{{_NS}}}t')
+        ).strip()
+
+    all_tables = list(doc.tables)
+    for idx, table in enumerate(all_tables):
+        if idx < keep_first_n_tables:
+            continue
+
+        total_cells = 0
+        text_cells = 0
+        text_chars = 0
+        for row in table.rows:
+            for cell in row.cells:
+                total_cells += 1
+                text = get_text(cell)
+                if text:
+                    text_cells += 1
+                    text_chars += len(text)
+
+        if total_cells == 0:
+            continue
+
+        empty_ratio = (total_cells - text_cells) / total_cells
+        should_remove = False
+        if text_cells == 0 and total_cells >= 4:
+            should_remove = True
+        elif empty_ratio > 0.85 and text_chars < 80 and total_cells >= 6:
+            should_remove = True
+        elif text_cells <= 2 and total_cells >= 8 and text_chars < 100:
+            should_remove = True
+
+        if should_remove:
+            table._element.getparent().remove(table._element)
+            removed += 1
+
+    if removed:
+        logger.info(f"Removed {removed} low-content injected table artifact(s).")
+    return removed
+
+
 def _is_noise_paragraph(text: str, blocklist: Set[str]) -> bool:
     """
     Returns True if text is a header/footer/page-number noise line.
@@ -244,6 +291,13 @@ def _is_noise_paragraph(text: str, blocklist: Set[str]) -> bool:
     if _PAGE_NUM_RE.match(norm):
         return True
     if _PAGE_OF_RE.match(norm):
+        return True
+
+    # Layer 2b: OCR/header garbage lines seen in converted PDFs.
+    compact = re.sub(r'[^a-z0-9]+', '', norm)
+    if 'productspecificationproductname' in compact:
+        return True
+    if compact in {'cckedby', 'checkedby'}:
         return True
 
     # Layer 3: very short ALL-CAPS lines — running header artefacts
@@ -294,9 +348,17 @@ def _clean_injected_content(
     """
     removed = 0
 
+    # Remove noisy standalone paragraphs entirely to avoid leaving empty lines.
+    paras_to_remove = []
     for para in src_doc.paragraphs:
         if _is_noise_paragraph(para.text, blocklist):
-            para.clear()
+            paras_to_remove.append(para)
+
+    for para in paras_to_remove:
+        p = para._p
+        parent = p.getparent()
+        if parent is not None:
+            parent.remove(p)
             removed += 1
 
     for table in src_doc.tables:
@@ -312,6 +374,12 @@ def _clean_injected_content(
             f"Section {section_num}: cleaned {removed} "
             f"noise items (headers/footers/page numbers)."
         )
+
+
+def _element_text_content(element) -> str:
+    """Extracts combined text for an XML element."""
+    _NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    return ''.join(t.text or '' for t in element.iter(f'{{{_NS}}}t')).strip()
 
 
 def _iter_all_paragraphs(doc):
@@ -360,7 +428,8 @@ def _inject_docx_content(
     anchor_p_xml,
     blocklist: Set[str],
     logger,
-    section_num: str
+    section_num: str,
+    include_pdf_tables: bool = False,
 ):
     """
     Opens pdf2docx temp DOCX, cleans noise, copies body elements
@@ -378,14 +447,41 @@ def _inject_docx_content(
 
     _clean_injected_content(src_doc, blocklist, logger, section_num)
 
+    inserted_nonblank = False
+    pending_blank_para = None
+
     for element in src_doc.element.body:
         if element.tag.endswith('}sectPr') or element.tag == 'sectPr':
             continue
+        if not include_pdf_tables and element.tag.split('}')[-1] == 'tbl':
+            continue
+
+        tag_name = element.tag.split('}')[-1]
+        if tag_name == 'p':
+            if not _element_text_content(element):
+                # Drop leading blanks and compress internal blank runs.
+                if not inserted_nonblank:
+                    continue
+                pending_blank_para = copy.deepcopy(element)
+                continue
+
+            # Insert at most one blank paragraph before non-blank content.
+            if pending_blank_para is not None:
+                try:
+                    blank_el = copy.deepcopy(pending_blank_para)
+                    current_anchor.addnext(blank_el)
+                    current_anchor = blank_el
+                except Exception:
+                    pass
+                pending_blank_para = None
+
         try:
             new_el = copy.deepcopy(element)
             _strip_drawing_elements(new_el)
             current_anchor.addnext(new_el)
             current_anchor = new_el
+            if tag_name == 'p' and _element_text_content(new_el):
+                inserted_nonblank = True
         except Exception as el_e:
             logger.warning(
                 f"Skipped element for section {section_num}: {el_e}"
@@ -401,6 +497,8 @@ def process_template(
     log_folder:          str,
     section_page_limits: Dict[str, int] = None,
     section_start_pages: Dict[str, int] = None,
+    preserve_template_tables: bool = False,
+    include_pdf_tables: bool = False,
 ):
     """
     Main pipeline:
@@ -423,6 +521,8 @@ def process_template(
     except Exception as e:
         logger.error(f"Failed to open template: {e}")
         raise
+
+    template_table_count = len(doc.tables)
 
     sections_filled    = 0
     warnings_count     = 0
@@ -484,7 +584,8 @@ def process_template(
                     anchor_p_xml  = current_anchor,
                     blocklist     = content.noise_blocklist,
                     logger        = logger,
-                    section_num   = section_num
+                    section_num   = section_num,
+                    include_pdf_tables = include_pdf_tables,
                 )
                 try:
                     os.remove(content.docx_path)
@@ -494,27 +595,6 @@ def process_template(
                 logger.warning(
                     f"Section {section_num}: no converted DOCX available."
                 )
-
-            for idx, img_bytes in enumerate(content.images):
-                try:
-                    img_stream     = io.BytesIO(img_bytes)
-                    new_p_xml      = OxmlElement('w:p')
-                    current_anchor.addnext(new_p_xml)
-                    current_anchor = new_p_xml
-
-                    tmp_para = doc.add_paragraph()
-                    run      = tmp_para.add_run()
-                    run.add_picture(img_stream, width=Inches(5.5))
-
-                    for r_elem in tmp_para._p.findall(qn('w:r')):
-                        new_p_xml.append(copy.deepcopy(r_elem))
-
-                    tmp_para._p.getparent().remove(tmp_para._p)
-
-                except Exception as img_e:
-                    logger.warning(
-                        f"Section {section_num} image #{idx}: {img_e}"
-                    )
 
             sections_filled += 1
             processed_sections.add(section_num)
@@ -530,12 +610,21 @@ def process_template(
 
     logger.info(f"Saving output to {output_path}")
     try:
-        _remove_noise_tables(doc, logger)
-        _remove_empty_visual_tables(doc, logger) 
+        # Safe in all modes: fixes converter-introduced zero-width tables.
         _fix_zero_width_tables(doc, logger)
-        _remove_repeated_header_paragraphs(doc, logger)
-        _remove_pdf_noise_paragraphs(doc, logger)
-        _collapse_blank_paragraphs(doc, logger)
+
+        if not preserve_template_tables:
+            _remove_noise_tables(doc, logger)
+            _remove_empty_visual_tables(doc, logger)
+            _remove_repeated_header_paragraphs(doc, logger)
+            _remove_pdf_noise_paragraphs(doc, logger)
+            _collapse_blank_paragraphs(doc, logger)
+        else:
+            logger.info(
+                "Template-preserve mode enabled: skipping global cleanup passes "
+                "that may remove static QIS tables."
+            )
+            _remove_low_content_injected_tables(doc, logger, template_table_count)
 
         logger.info(f"Saving output to {output_path}")
         doc.save(output_path)

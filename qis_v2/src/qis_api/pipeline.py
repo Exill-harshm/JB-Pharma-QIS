@@ -139,7 +139,7 @@ class QisApiPipeline:
 
         try:
             for i in range(min(doc.page_count, 12)):
-                text = doc.load_page(i).get_text("text", sort=True).lower()
+                text = ApiInfoExtractor._read_page_text(doc.load_page(i)).lower()
                 if any(needle in text for needle in needles):
                     return True
             return False

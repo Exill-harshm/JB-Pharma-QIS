@@ -18,6 +18,7 @@ from logger_setup import get_logger
 from config_loader import load_config
 from section_mapper import build_section_map
 from docx_builder import process_template
+from v2_overlay import apply_qis_v2_overlay
 
 
 def main():
@@ -49,7 +50,25 @@ def main():
             log_folder          = config.log_folder,
             section_page_limits = config.section_page_limits,
             section_start_pages = config.section_start_pages,
+            preserve_template_tables = config.enable_qis_v2_overlay,
+            include_pdf_tables  = config.include_pdf_tables,
         )
+
+        v2_overlay_warnings = []
+        if config.enable_qis_v2_overlay:
+            logger.info("Starting QIS v2 overlay stage.")
+            v2_overlay_warnings = apply_qis_v2_overlay(
+                output_docx_path=config.output_docx_path,
+                source_pdf_folder=config.source_pdf_folder,
+                log_folder=config.log_folder,
+                dossier_root=config.dossier_root,
+            )
+            for msg in v2_overlay_warnings:
+                logger.warning(msg)
+            if not v2_overlay_warnings:
+                logger.info("QIS v2 overlay completed successfully.")
+
+        warnings += len(v2_overlay_warnings)
 
         summary_lines = [
             "",
@@ -59,6 +78,7 @@ def main():
             f"  Sections successfully filled : {sections_filled}",
             f"  Warnings generated           : {warnings}",
             f"  Total failures               : {failures}",
+            f"  QIS v2 overlay               : {'ENABLED' if config.enable_qis_v2_overlay else 'DISABLED'}",
             f"  Output DOCX                  : {config.output_docx_path}",
             "=" * 50,
         ]

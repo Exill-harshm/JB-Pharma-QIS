@@ -12,13 +12,29 @@ from typing import Dict
 @dataclass
 class Config:
     """Strongly typed configuration object"""
-    template_docx_path:   str
-    source_pdf_folder:    str
-    output_docx_path:     str
-    log_folder:           str
-    mapping_logic_pdf_path: str                    = ""
-    section_page_limits:  Dict[str, int]           = field(default_factory=dict)
-    section_start_pages:  Dict[str, int]           = field(default_factory=dict)
+    template_docx_path:     str
+    source_pdf_folder:      str
+    output_docx_path:       str
+    log_folder:             str
+    enable_qis_v2_overlay:  bool          = True
+    include_pdf_tables:     bool          = False
+    dossier_root:           str           = ""
+    mapping_logic_pdf_path: str           = ""
+    section_page_limits:    Dict[str, int] = field(default_factory=dict)
+    section_start_pages:    Dict[str, int] = field(default_factory=dict)
+
+
+def _as_bool(value, default: bool = True) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
 
 
 def load_config(config_path: str = "config.yaml") -> Config:
@@ -62,6 +78,19 @@ def load_config(config_path: str = "config.yaml") -> Config:
     if not os.path.exists(data["log_folder"]):
         os.makedirs(data["log_folder"], exist_ok=True)
 
+    raw_dossier_root = str(data.get("dossier_root", "") or "").strip()
+    if raw_dossier_root and not os.path.exists(raw_dossier_root):
+        raise NotADirectoryError(
+            f"Configured dossier_root not found: {raw_dossier_root}"
+        )
+
+    enable_qis_v2_overlay = _as_bool(
+        data.get("enable_qis_v2_overlay", True), default=True
+    )
+    include_pdf_tables = _as_bool(
+        data.get("include_pdf_tables", False), default=False
+    )
+
     raw_limits = data.get("section_page_limits", {}) or {}
     section_page_limits = {
         str(k): int(v) for k, v in raw_limits.items()
@@ -73,11 +102,14 @@ def load_config(config_path: str = "config.yaml") -> Config:
     }
 
     return Config(
-        template_docx_path   = data["template_docx_path"],
+        template_docx_path     = data["template_docx_path"],
         mapping_logic_pdf_path = data.get("mapping_logic_pdf_path", ""),
-        source_pdf_folder    = data["source_pdf_folder"],
-        output_docx_path     = data["output_docx_path"],
-        log_folder           = data["log_folder"],
-        section_page_limits  = section_page_limits,
-        section_start_pages  = section_start_pages,
+        source_pdf_folder      = data["source_pdf_folder"],
+        output_docx_path       = data["output_docx_path"],
+        log_folder             = data["log_folder"],
+        enable_qis_v2_overlay = enable_qis_v2_overlay,
+        include_pdf_tables     = include_pdf_tables,
+        dossier_root           = raw_dossier_root,
+        section_page_limits    = section_page_limits,
+        section_start_pages    = section_start_pages,
     )
