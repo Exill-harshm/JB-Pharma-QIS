@@ -1,5 +1,13 @@
 # QIS Automation — CTD Module 3 DOCX Generator
 
+## QIS v2 (Table-Driven)
+
+A newer, generic table-driven pipeline is included under `qis_v2/`.
+
+- Entry point: `qis_v2/run.py`
+- Core package: `qis_v2/src/qis_api/`
+- Uses direct Module 1 QIS table extraction with editable DOCX table fill.
+
 Automatically populates a **Quality Information Summary (QIS)** DOCX template with content extracted from CTD Module 3 source PDFs.
 
 ---

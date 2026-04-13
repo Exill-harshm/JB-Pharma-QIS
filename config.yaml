@@ -4,6 +4,15 @@ source_pdf_folder:     "D:\\JB Automation\\Cardiolek\\Module 3\\32-Body-Data"
 output_docx_path:      "D:\\JB Pharma internal\\JB Pharma\\Cardiolek\\Output_QIS.docx"
 log_folder:            "D:\\JB Pharma internal\\JB Pharma\\Cardiolek"
 
+# Unified mode options
+# Runs table-driven QIS v2 overlay after legacy placeholder filling.
+enable_qis_v2_overlay: true
+# Disable legacy pdf2docx table injection to avoid random line artifacts.
+include_pdf_tables: false
+# Optional: set dossier root explicitly (contains Module 1 + Module 3).
+# Leave empty to auto-derive from source_pdf_folder.
+dossier_root: ""
+
 # How many pages to SKIP at start of each PDF (0-based)
 # These are cover pages, TOC pages, signature pages — not real content
 section_start_pages:
