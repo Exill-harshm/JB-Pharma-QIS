@@ -398,6 +398,39 @@ class ApiInfoExtractor:
         return ""
 
     def _company_from_manufactured_by(self, lines: list[str]) -> str:
+        def normalize_words(value: str) -> str:
+            return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+        def collapse_exact_repeat(value: str) -> str:
+            words = value.split()
+            if len(words) >= 6 and len(words) % 2 == 0:
+                half = len(words) // 2
+                first = " ".join(words[:half])
+                second = " ".join(words[half:])
+                if normalize_words(first) == normalize_words(second):
+                    return first
+            return value
+
+        def needs_continuation(name: str) -> bool:
+            tail = name.lower().rstrip(" .,;:")
+            return bool(
+                re.search(
+                    r"\b(co|co,|co\.|ltd|ltd\.|limited|inc|inc\.|corp|corp\.|corporation|company|pharmaceutical|chemical|laboratories|labs|and|&)$",
+                    tail,
+                )
+            )
+
+        def is_continuation_line(value: str) -> bool:
+            low = value.lower().strip()
+            if not low:
+                return False
+            if re.fullmatch(r"\d+", low):
+                return False
+            if re.search(r"\b\d+\s+of\s+\d+\b", low):
+                return False
+            stop_tokens = ("certificate", "address", "responsibility", "section")
+            return not any(token in low for token in stop_tokens)
+
         for i, line in enumerate(lines):
             low = line.lower()
             if "manufactured" not in low or " by " not in low:
@@ -406,10 +439,27 @@ class ApiInfoExtractor:
             candidate = tail
             if candidate.endswith("."):
                 candidate = candidate[:-1].strip()
-            # If split line ends too early (e.g., 'Zhejiang' or 'M/s.'), append next line.
-            if (len(candidate.split()) <= 2 or candidate.lower() in {"m/s", "m/s."}) and i + 1 < len(lines):
-                candidate = f"{candidate} {self._clean(lines[i + 1])}".strip()
-            candidate = self._clean(candidate)
+
+            # If line wraps around legal-entity abbreviations, append continuation lines.
+            lookahead = min(len(lines), i + 3)
+            j = i + 1
+            while j < lookahead and (
+                len(candidate.split()) <= 2
+                or candidate.lower() in {"m/s", "m/s."}
+                or needs_continuation(candidate)
+            ):
+                nxt = self._clean(lines[j])
+                if not is_continuation_line(nxt):
+                    break
+
+                # Stop if next line just repeats the already captured company.
+                if normalize_words(nxt) and normalize_words(nxt) in normalize_words(candidate):
+                    break
+
+                candidate = f"{candidate} {nxt}".strip()
+                j += 1
+
+            candidate = collapse_exact_repeat(self._clean(candidate))
             if candidate:
                 return candidate
         return ""
@@ -430,21 +480,44 @@ class ApiInfoExtractor:
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
         compact = re.sub(r"\s+", " ", text)
 
-        main_company = self._match(
-            compact,
-            [r"is manufactured[^\n\.]*?by\s+([^\.\n]+)"],
-            "",
-        )
-        inter_sentence = self._match(
-            compact,
-            [r"([A-Za-z0-9\-\s\(\),]+intermediate[^\n\.]*?is manufactured[^\n\.]*?by\s+[^\.\n]+)"],
-            "",
-        )
-        inter_company = self._match(
-            compact,
-            [r"intermediate[^\n\.]*?is manufactured[^\n\.]*?by\s+([^\.\n]+)"],
-            "",
-        )
+        main_company = self._company_from_manufactured_by(lines)
+        if not main_company:
+            main_company = self._match(
+                compact,
+                [r"is manufactured[^\n]*?by\s+(.+?)(?:\s{2,}|$)"],
+                "",
+            )
+
+        inter_sentence = ""
+        inter_line_idx: int | None = None
+        for i, line in enumerate(lines):
+            low = line.lower()
+            if "intermediate" in low and "manufactured" in low and " by " in low:
+                inter_sentence = self._clean(line)
+                inter_line_idx = i
+                break
+
+        if not inter_sentence:
+            inter_sentence = self._match(
+                compact,
+                [r"([A-Za-z0-9\-\s\(\),;/]+?intermediate[^\n]*?is manufactured[^\n]*?by\s+.+?)(?:\s{2,}|$)"],
+                "",
+            )
+
+        inter_company = ""
+        if inter_sentence and re.search(r"\bby\b", inter_sentence, flags=re.IGNORECASE):
+            inter_company = self._clean(
+                re.split(r"\bby\b", inter_sentence, flags=re.IGNORECASE, maxsplit=1)[-1]
+            )
+
+            # Reuse robust continuation logic if line-wrap truncated the company tail.
+            if inter_line_idx is not None and inter_line_idx + 1 < len(lines):
+                extended = self._company_from_manufactured_by(lines[inter_line_idx:inter_line_idx + 3])
+                if extended:
+                    inter_company = extended
+
+            inter_prefix = re.split(r"\bby\b", inter_sentence, flags=re.IGNORECASE, maxsplit=1)[0]
+            inter_sentence = f"{self._clean(inter_prefix)} by {inter_company}"
 
         inter_address = ""
         if inter_company:
@@ -466,7 +539,7 @@ class ApiInfoExtractor:
             if parts:
                 parts.append("")
             parts.append(inter_sentence + ".")
-        if inter_company:
+        if inter_company and inter_address:
             if parts:
                 parts.append("")
             parts.append(inter_company)
