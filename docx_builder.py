@@ -11,7 +11,8 @@ import re
 import copy
 import os
 import docx
-from docx.shared import RGBColor
+import fitz
+from docx.shared import RGBColor, Inches
 from typing import Dict, Set
 from logger_setup import get_logger
 
@@ -375,6 +376,177 @@ def _clean_injected_content(
             f"noise items (headers/footers/page numbers)."
         )
 
+    if section_num == "3.2.S.6":
+        _trim_s6_container_closure_content(src_doc, logger)
+    elif section_num == "3.2.P.3.3":
+        _trim_p33_narrative_content(src_doc, logger)
+
+
+def _trim_s6_container_closure_content(src_doc, logger) -> None:
+    """
+    For 3.2.S.6, keep only one concise descriptive paragraph in the template.
+    This prevents spillover of 3.2.S.6.1/3.2.S.6.2 and avoids carrying 3.2-style
+    headings into the 2.3 summary narrative.
+    """
+    body = src_doc.element.body
+
+    def _is_candidate(text: str) -> bool:
+        text = " ".join(text.split())
+        if not text:
+            return False
+        low = text.lower()
+
+        if re.match(r'^\d+(\s+of\s+\d+)?$', low):
+            return False
+        if low.startswith("3.2.s.6"):
+            return False
+        if any(tok in low for tok in ("drug mater file", "version:", "module:")):
+            return False
+        if re.search(r"\bfigure\b", low):
+            return False
+        if re.search(r"\btable\b", low):
+            return False
+
+        # Keep the first substantial descriptive sentence block.
+        return len(text) >= 90 and text.count(" ") >= 12
+
+    keep_p = None
+    for para in src_doc.paragraphs:
+        if _is_candidate(para.text):
+            keep_p = para._p
+            break
+
+    if keep_p is None:
+        return
+
+    removed = 0
+    for elem in list(body):
+        tag_name = elem.tag.split('}')[-1]
+        if tag_name == 'p' and elem == keep_p:
+            continue
+        parent = elem.getparent()
+        if parent is not None:
+            parent.remove(elem)
+            removed += 1
+
+    if removed:
+        logger.info(f"Section 3.2.S.6: trimmed injected content to a single summary paragraph.")
+
+
+def _trim_p33_narrative_content(src_doc, logger) -> None:
+    """
+    For 3.2.P.3.3 keep narrative text only and remove flow-chart tail labels.
+    The flow diagram itself is inserted separately as a rendered image.
+    """
+    body = src_doc.element.body
+    cut_started = False
+    removed = 0
+
+    for elem in list(body):
+        if elem.tag.split('}')[-1] != 'p':
+            continue
+
+        text = " ".join(_element_text_content(elem).split())
+        low = text.lower()
+
+        if low.startswith("3.2.p.3.3 description of manufacturing process"):
+            parent = elem.getparent()
+            if parent is not None:
+                parent.remove(elem)
+                removed += 1
+            continue
+
+        if re.search(r"\b(manufacturing process flow chart|flow\s+diagram)\b", low):
+            cut_started = True
+
+        if cut_started:
+            parent = elem.getparent()
+            if parent is not None:
+                parent.remove(elem)
+                removed += 1
+
+    if removed:
+        logger.info("Section 3.2.P.3.3: trimmed flow-chart tail text; image will be inserted separately.")
+
+
+def _extract_p33_flow_diagram_image(pdf_path: str, log_folder: str, logger) -> str:
+    """Renders the 3.2.P.3.3 flow diagram area from source PDF into a PNG."""
+    doc = None
+    try:
+        doc = fitz.open(pdf_path)
+        target_page = None
+        for i in range(doc.page_count - 1, -1, -1):
+            page = doc[i]
+            text = page.get_text("text", sort=True).lower()
+            if (
+                "manufacturing process flow chart" in text
+                or ("dispensing" in text and "packing" in text and "filtration" in text)
+            ):
+                target_page = page
+                break
+
+        if target_page is None:
+            logger.warning("Section 3.2.P.3.3: could not locate flow-chart page in source PDF.")
+            return ""
+
+        page = target_page
+        page_rect = page.rect
+
+        top_hits = page.search_for("MANUFACTURING PROCESS FLOW CHART")
+        if not top_hits:
+            top_hits = page.search_for("Flow diagram of the manufacturing process")
+        top_y = top_hits[0].y0 - 8 if top_hits else page_rect.y0 + page_rect.height * 0.08
+
+        bottom_y = None
+        for token in ("Packing", "Labeling", "Visual Inspection", "Terminal Sterilization"):
+            hits = page.search_for(token)
+            if hits:
+                y = max(r.y1 for r in hits) + 18
+                bottom_y = y if bottom_y is None else max(bottom_y, y)
+
+        if bottom_y is None:
+            bottom_y = page_rect.y0 + page_rect.height * 0.92
+
+        x0 = page_rect.x0 + page_rect.width * 0.04
+        x1 = page_rect.x1 - page_rect.width * 0.04
+        y0 = max(page_rect.y0, top_y)
+        y1 = min(page_rect.y1, bottom_y)
+
+        if y1 - y0 < 40:
+            logger.warning("Section 3.2.P.3.3: flow-chart clip too small; using full-page body area.")
+            y0 = page_rect.y0 + page_rect.height * 0.08
+            y1 = page_rect.y0 + page_rect.height * 0.95
+
+        clip = fitz.Rect(x0, y0, x1, y1)
+        pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0), clip=clip, alpha=False)
+
+        img_path = os.path.join(log_folder, "temp_3.2.P.3.3_flow_diagram.png")
+        pix.save(img_path)
+        logger.info(f"Section 3.2.P.3.3: extracted flow diagram image -> {img_path}")
+        return img_path
+    except Exception as e:
+        logger.warning(f"Section 3.2.P.3.3: flow diagram image extraction failed: {e}")
+        return ""
+    finally:
+        if doc is not None:
+            doc.close()
+
+
+def _insert_p33_flow_diagram_image(doc, image_path: str, logger) -> bool:
+    """Inserts extracted flow diagram under the template flow-diagram prompt."""
+    try:
+        for para in doc.paragraphs:
+            low = para.text.strip().lower()
+            if "flow diagram of the manufacturing process" in low:
+                run = para.add_run()
+                run.add_break()
+                run.add_picture(image_path, width=Inches(5.8))
+                logger.info("Section 3.2.P.3.3: inserted flow diagram image under template prompt.")
+                return True
+    except Exception as e:
+        logger.warning(f"Section 3.2.P.3.3: failed to insert flow diagram image: {e}")
+    return False
+
 
 def _element_text_content(element) -> str:
     """Extracts combined text for an XML element."""
@@ -410,7 +582,10 @@ def _strip_drawing_elements(element):
     """
     DRAWING_TAGS = {
         '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}drawing',
+        '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}pict',
         '{urn:schemas-microsoft-com:vml}imagedata',
+        '{urn:schemas-microsoft-com:vml}shape',
+        '{urn:schemas-microsoft-com:office:office}OLEObject',
         '{http://schemas.openxmlformats.org/drawingml/2006/main}blipFill',
     }
     to_remove = [n for n in element.iter() if n.tag in DRAWING_TAGS]
@@ -575,8 +750,34 @@ def process_template(
                 section_start_pages = section_start_pages,
             )
 
-            paragraph.clear()
             current_anchor = paragraph._p
+            if section_num == "3.2.S.6":
+                # For this section, inject AFTER the static template description line.
+                paragraph_index = None
+                for idx, p in enumerate(doc.paragraphs):
+                    if p._p == paragraph._p:
+                        paragraph_index = idx
+                        break
+                if paragraph_index is not None:
+                    for p in doc.paragraphs[paragraph_index + 1 : paragraph_index + 8]:
+                        if "description of the container closure system" in p.text.strip().lower():
+                            current_anchor = p._p
+                            break
+            elif section_num == "3.2.P.3.3":
+                # Put narrative text under (b). Flow diagram (a) is inserted as image.
+                paragraph_index = None
+                for idx, p in enumerate(doc.paragraphs):
+                    if p._p == paragraph._p:
+                        paragraph_index = idx
+                        break
+                if paragraph_index is not None:
+                    for p in doc.paragraphs[paragraph_index + 1 : paragraph_index + 10]:
+                        low = p.text.strip().lower()
+                        if low.startswith("(b)") and "narrative description" in low:
+                            current_anchor = p._p
+                            break
+
+            paragraph.clear()
 
             if content.docx_path and os.path.exists(content.docx_path):
                 current_anchor = _inject_docx_content(
@@ -595,6 +796,17 @@ def process_template(
                 logger.warning(
                     f"Section {section_num}: no converted DOCX available."
                 )
+
+            if section_num == "3.2.P.3.3":
+                flow_img_path = _extract_p33_flow_diagram_image(pdf_path, log_folder, logger)
+                if flow_img_path and os.path.exists(flow_img_path):
+                    inserted = _insert_p33_flow_diagram_image(doc, flow_img_path, logger)
+                    if not inserted:
+                        logger.warning("Section 3.2.P.3.3: flow-diagram prompt not found in template.")
+                    try:
+                        os.remove(flow_img_path)
+                    except Exception:
+                        pass
 
             sections_filled += 1
             processed_sections.add(section_num)

@@ -151,33 +151,31 @@ class QisDocxFiller:
 
     def _fill_manufacture_section(self, doc: Document, info: ManufactureInfo) -> bool:
         heading_index = None
-        refer_paragraph = None
-        heading_paragraph = None
         for index, paragraph in enumerate(doc.paragraphs):
             text = paragraph.text.strip()
-            if text == "2.3.S.2.1 Manufacturer(s) (name, manufacturer)":
+            if text.startswith("2.3.S.2.1 Manufacturer(s)"):
                 heading_index = index
-                heading_paragraph = paragraph
-                continue
-            if heading_index is not None and index > heading_index and text == "Refer Section 3.2.S.2.1":
-                refer_paragraph = paragraph
-                continue
+                break
 
-        if refer_paragraph is None or heading_paragraph is None:
-            return False
-
-        heading_paragraph.text = info.section_heading
-        refer_paragraph.text = info.subtitle
+        # If legacy "Refer Section" placeholder exists, clear it.
+        if heading_index is not None:
+            for index, paragraph in enumerate(doc.paragraphs):
+                text = paragraph.text.strip()
+                if index > heading_index and text == "Refer Section 3.2.S.2.1":
+                    paragraph.text = ""
+                    break
 
         table = self._find_s2_manufacturer_table(doc)
-        if table is not None:
-            self._set_text(table, 1, 0, info.name_and_address)
-            self._set_text(table, 1, 1, info.responsibility)
-            self._set_text(table, 1, 2, info.api_pq_number)
-            self._set_text(table, 1, 3, info.letter_of_access)
-            while len(table.rows) > 2:
-                row = table.rows[2]._tr
-                row.getparent().remove(row)
+        if table is None:
+            return False
+
+        self._set_text(table, 1, 0, info.name_and_address)
+        self._set_text(table, 1, 1, info.responsibility)
+        self._set_text(table, 1, 2, info.api_pq_number)
+        self._set_text(table, 1, 3, info.letter_of_access)
+        while len(table.rows) > 2:
+            row = table.rows[2]._tr
+            row.getparent().remove(row)
 
         return True
 
