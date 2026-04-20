@@ -22,6 +22,7 @@ PLACEHOLDER_PATTERN = re.compile(
 )
 
 MANUAL_ENTRY_SECTIONS = {'1.2', '1.3', '1.4', '1.5', '1.5.1', '1.5.2', '1.6'}
+OVERLAY_MANAGED_SECTIONS = {'3.2.S.2.1', '3.2.P.3.1'}
 
 # Generic regex patterns — work for ANY document, no company-specific strings
 _PAGE_NUM_RE = re.compile(r'^\d{1,4}$')
@@ -718,6 +719,14 @@ def process_template(
             logger.info(
                 f"Section {section_num}: Module 1 admin - leave for manual entry."
             )
+            continue
+
+        if preserve_template_tables and section_num in OVERLAY_MANAGED_SECTIONS:
+            logger.info(
+                f"Section {section_num}: handled by QIS v2 overlay - clearing legacy placeholder."
+            )
+            paragraph.clear()
+            processed_sections.add(section_num)
             continue
 
         if section_num not in section_map:

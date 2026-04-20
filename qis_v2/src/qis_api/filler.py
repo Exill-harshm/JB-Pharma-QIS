@@ -76,6 +76,8 @@ class QisDocxFiller:
                     continue
                 self._set_text(table, row_index, col_index, values[source_index])
 
+        self._apply_grouped_postal_address_placeholders(table, summary.summary_values_by_label)
+
         if len(doc.tables) > 1:
             self._fill_admin_summary_table(doc.tables[1], summary.summary_values_by_label)
 
@@ -125,9 +127,84 @@ class QisDocxFiller:
             candidate = values[0].strip()
             if not candidate:
                 continue
-            if candidate.lower().endswith("use only)"):
-                continue
             row.cells[1].text = candidate
+
+    def _apply_grouped_postal_address_placeholders(self, table, source_map: dict[str, list[str]]) -> None:
+        self._apply_grouped_placeholder_block(
+            table,
+            source_map,
+            [
+                "Building/PO Box number",
+                "Road/Street",
+                "Plant/Zone",
+                "Village/suburb",
+            ],
+        )
+        self._apply_grouped_placeholder_block(
+            table,
+            source_map,
+            [
+                "Town/City",
+                "District and Mandal",
+                "Province/State",
+                "Postal code",
+            ],
+        )
+
+    def _apply_grouped_placeholder_block(
+        self,
+        table,
+        source_map: dict[str, list[str]],
+        label_group: list[str],
+    ) -> None:
+        if not label_group or len(table.rows) == 0:
+            return
+
+        label_to_row: dict[str, int] = {}
+        for row_index, row in enumerate(table.rows):
+            if not row.cells:
+                continue
+            row_label_key = self._normalize_label(row.cells[0].text)
+            if row_label_key and row_label_key not in label_to_row:
+                label_to_row[row_label_key] = row_index
+
+        row_indices: list[int] = []
+        values: list[str] = []
+        for raw_label in label_group:
+            key = self._normalize_label(raw_label)
+            row_index = label_to_row.get(key)
+            if row_index is None:
+                return
+            row_indices.append(row_index)
+
+            source_values = source_map.get(key, [])
+            if source_values:
+                values.append(source_values[0].strip())
+            else:
+                values.append("")
+
+        start_row = min(row_indices)
+        end_row = max(row_indices)
+        if start_row == end_row:
+            return
+
+        if len(table.rows[start_row].cells) < 2:
+            return
+
+        # Clear existing values in the grouped range before merging.
+        for row_index in row_indices:
+            row = table.rows[row_index]
+            for col_index in range(1, len(row.cells)):
+                row.cells[col_index].text = ""
+
+        for col_index in range(1, len(table.rows[start_row].cells)):
+            try:
+                table.cell(start_row, col_index).merge(table.cell(end_row, col_index))
+            except Exception:
+                pass
+
+        grouped_value = "\n".join(values)
+        table.cell(start_row, 1).text = grouped_value
 
     @staticmethod
     def _normalize_label(label: str) -> str:

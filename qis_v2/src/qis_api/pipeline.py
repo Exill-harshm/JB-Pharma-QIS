@@ -7,7 +7,7 @@ import fitz
 from .config import PipelineConfig
 from .extractor import ApiInfoExtractor
 from .filler import QisDocxFiller
-from .models import PipelineResult
+from .models import P31ManufacturerInfo, PipelineResult, SummaryInfo
 from .section_mapper import SectionMapper
 
 
@@ -40,6 +40,7 @@ class QisApiPipeline:
         summary_info = self._extractor.extract_summary_info(summary_pdf_path) if summary_pdf_path else None
         manufacture_info = self._extractor.extract_manufacture_info(api_pdf_path)
         p31_info = self._extractor.extract_p31_manufacturer_info(p31_pdf_path) if p31_pdf_path else None
+        p31_info = self._enrich_p31_registered_office(p31_info, summary_info)
         if not api_info.api_name:
             warnings.append("Could not confidently extract API name.")
         if not api_info.manufacturer_text:
@@ -125,6 +126,40 @@ class QisApiPipeline:
                 return candidate
 
         return scan_pool[0]
+
+    @staticmethod
+    def _enrich_p31_registered_office(
+        p31_info: P31ManufacturerInfo | None,
+        summary_info: SummaryInfo | None,
+    ) -> P31ManufacturerInfo | None:
+        if p31_info is None or summary_info is None:
+            return p31_info
+        if "registered office" in p31_info.name_and_address.lower():
+            return p31_info
+
+        applicant_values: list[str] = []
+        for key, values in summary_info.summary_values_by_label.items():
+            if "applicant name and address" not in key:
+                continue
+            if values and any(value.strip() for value in values):
+                applicant_values = values
+                break
+        if not applicant_values:
+            return p31_info
+
+        registered_office = applicant_values[0].strip()
+        if not registered_office:
+            return p31_info
+
+        merged_address = f"REGISTERED OFFICE:\n{registered_office}"
+        if p31_info.name_and_address.strip():
+            merged_address = f"{merged_address}\n\n{p31_info.name_and_address.strip()}"
+
+        return P31ManufacturerInfo(
+            section_heading=p31_info.section_heading,
+            name_and_address=merged_address,
+            responsibility=p31_info.responsibility,
+        )
 
     @staticmethod
     def _contains_qis_heading(pdf_path: Path) -> bool:
