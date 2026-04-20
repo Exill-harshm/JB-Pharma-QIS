@@ -49,6 +49,9 @@ def main():
             log_folder          = config.log_folder,
             section_page_limits = config.section_page_limits,
             section_start_pages = config.section_start_pages,
+            table_only_sections = config.table_only_sections,
+            table_only_all_sections = config.table_only_all_sections,
+            table_keyword_by_template_section = config.table_keyword_by_template_section,
         )
 
         summary_lines = [
