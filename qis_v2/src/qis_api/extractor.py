@@ -145,6 +145,7 @@ class ApiInfoExtractor:
             [r"performs all\s+([^\.]+)\s+for this product", r"Responsibility\s+([\s\S]*?)\s+Name and Address"],
             "Manufacturing, testing",
         )
+        responsibility = self._normalize_p31_responsibility(responsibility)
 
         return P31ManufacturerInfo(
             section_heading="2.3.P.3.1 Manufacturer(s)",
@@ -318,6 +319,27 @@ class ApiInfoExtractor:
         if len(lines) >= 2:
             values_by_label[town_key] = [lines[0]] + town_values[1:]
             values_by_label[province_key] = [lines[1]]
+
+    def _normalize_p31_responsibility(self, value: str) -> str:
+        cleaned = self._clean(value)
+        if not cleaned:
+            return "Manufacturing, testing"
+
+        lower = cleaned.lower()
+        responsibilities: list[str] = []
+
+        if any(token in lower for token in ("manufactur", "formulat", "filling")):
+            responsibilities.append("Formulation")
+        if "packag" in lower:
+            responsibilities.append("packaging")
+        if "label" in lower:
+            responsibilities.append("labelling")
+        if any(token in lower for token in ("test", "quality control", "qc")):
+            responsibilities.append("testing")
+
+        if len(responsibilities) >= 2:
+            return ", ".join(responsibilities)
+        return cleaned
 
     def _extract_related_values_from_table(self, rows: list[list[str | None]]) -> list[str]:
         for row in reversed(rows):
