@@ -52,6 +52,9 @@ def main():
             section_start_pages = config.section_start_pages,
             preserve_template_tables = config.enable_qis_v2_overlay,
             include_pdf_tables  = config.include_pdf_tables,
+            table_only_sections = config.table_only_sections,
+            table_only_all_sections = config.table_only_all_sections,
+            table_keyword_by_template_section = config.table_keyword_by_template_section,
         )
 
         v2_overlay_warnings = []
