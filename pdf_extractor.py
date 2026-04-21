@@ -168,10 +168,17 @@ def _detect_content_pages(pdf_path: str, logger) -> Optional[List[int]]:
     """
     result = _detect_with_layout(pdf_path, logger)
     if result is not None:
-        return result
+        # Prevent bug where pymupdf4llm chunks all return page 0, truncating the PDF.
+        if len(result) > 1 and all(p == 0 for p in result):
+            logger.warning(
+                f"{os.path.basename(pdf_path)}: AI chunks lost page indices. Using fallback."
+            )
+        else:
+            # Reconstruct unique sorted page list to fix duplicate chunk indices
+            return sorted(list(set(result)))
+            
     logger.warning(
-        f"{os.path.basename(pdf_path)}: "
-        f"Using fallback clip-based page detection."
+        f"{os.path.basename(pdf_path)}: Using fallback clip-based page detection."
     )
     return _detect_with_fallback(pdf_path, logger)
 

@@ -1,8 +1,8 @@
-template_docx_path:    "D:\\JB Pharma internal\\JB Pharma\\Tagging- mapping logic\\Tagging- mapping logic\\QUALITY INFORMATION SUMMARY.docx"
+template_docx_path:    "C:\\Users\\exill\\OneDrive - Exillar\\Desktop\\Projects\\JB Pharma\\Tagging- mapping logic\\Tagging- mapping logic\\QUALITY INFORMATION SUMMARY.docx"
 mapping_logic_pdf_path: ""
-source_pdf_folder:     "D:\\JB Automation\\Cardiolek\\Module 3\\32-Body-Data"
-output_docx_path:      "D:\\JB Pharma internal\\JB Pharma\\Cardiolek\\Output_QIS.docx"
-log_folder:            "D:\\JB Pharma internal\\JB Pharma\\Cardiolek"
+source_pdf_folder:     "C:\\Users\\exill\\OneDrive - Exillar\\Desktop\\Projects\\JB Pharma\\Cardiolek\\Module 3\\32-Body-Data"
+output_docx_path:      "C:\\Users\\exill\\OneDrive - Exillar\\Desktop\\Projects\\JB Pharma\\Cardiolek\\Output\\Output_QIS.docx"
+log_folder:            "C:\\Users\\exill\\OneDrive - Exillar\\Desktop\\Projects\\JB Pharma\\Cardiolek\\Output\\logger"
 
 # Unified mode options
 # Runs table-driven QIS v2 overlay after legacy placeholder filling.
@@ -27,3 +27,16 @@ section_page_limits:
   "3.2.P.7":   2    # Take 2 pages of real content (summary + first spec page)
   "3.2.S.6":   3
   "3.2.S.7":   3
+
+# For these sections, inject only table elements from extracted content.
+table_only_sections:
+  - "3.2.S.4.1"
+
+# Set true to inject only tables for ALL sections/PDFs.
+table_only_all_sections: false
+
+# Optional: force table-only for specific template sections by keyword in table text.
+# Template heading (left) is constant (e.g., 2.3.S.4.1), while referred 3.2.* source
+# section can vary medicine-to-medicine.
+table_keyword_by_template_section:
+  "2.3.S.4.1": "Specification"
