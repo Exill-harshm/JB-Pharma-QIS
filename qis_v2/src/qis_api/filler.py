@@ -55,9 +55,14 @@ class QisDocxFiller:
 
         table = doc.tables[0]
 
-        # Copy-as-table behavior: clear existing placeholder values first.
+        # Clear only rows that have extracted source values.
+        # This preserves static merged rows such as section headings.
         for row_index, row in enumerate(table.rows):
             if not row.cells:
+                continue
+            label_text = row.cells[0].text
+            values = self._lookup_summary_values(label_text, summary.summary_values_by_label)
+            if not values:
                 continue
             for col_index in range(1, len(row.cells)):
                 row.cells[col_index].text = ""

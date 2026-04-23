@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import fitz
@@ -151,15 +152,131 @@ class QisApiPipeline:
         if not registered_office:
             return p31_info
 
-        merged_address = f"REGISTERED OFFICE:\n{registered_office}"
-        if p31_info.name_and_address.strip():
-            merged_address = f"{merged_address}\n\n{p31_info.name_and_address.strip()}"
+        factory_block = QisApiPipeline._extract_labeled_block(
+            p31_info.name_and_address,
+            heading="FACTORY ADDRESS:",
+            fallback_to_full=True,
+        )
+
+        merged_address = QisApiPipeline._compose_p31_address(
+            registered_office_block=registered_office,
+            factory_block=factory_block,
+        )
 
         return P31ManufacturerInfo(
             section_heading=p31_info.section_heading,
             name_and_address=merged_address,
             responsibility=p31_info.responsibility,
         )
+
+    @staticmethod
+    def _compose_p31_address(registered_office_block: str, factory_block: str) -> str:
+        registered_lines = QisApiPipeline._clean_nonempty_lines(registered_office_block)
+        factory_lines = QisApiPipeline._clean_nonempty_lines(factory_block)
+
+        reg_org, reg_tail = QisApiPipeline._split_org_and_address_lines(registered_lines)
+        fac_org, fac_tail = QisApiPipeline._split_org_and_address_lines(factory_lines)
+
+        org_lines = reg_org or fac_org
+
+        # Fallback: if the org split found nothing, try exact common prefix.
+        if not org_lines:
+            common_prefix = QisApiPipeline._common_prefix_lines(registered_lines, factory_lines)
+            org_lines = common_prefix
+            reg_tail = registered_lines[len(common_prefix) :]
+            fac_tail = factory_lines[len(common_prefix) :]
+
+        parts: list[str] = []
+        if org_lines:
+            parts.append("\n".join(org_lines))
+
+        parts.append("REGISTERED OFFICE:")
+        if reg_tail:
+            parts.append("\n".join(reg_tail))
+        elif registered_lines:
+            parts.append("\n".join(registered_lines))
+
+        parts.append("FACTORY ADDRESS:")
+        if fac_tail:
+            parts.append("\n".join(fac_tail))
+        elif factory_lines:
+            parts.append("\n".join(factory_lines))
+
+        return "\n\n".join(part for part in parts if part.strip())
+
+    @staticmethod
+    def _extract_labeled_block(text: str, heading: str, fallback_to_full: bool = False) -> str:
+        if not text.strip():
+            return ""
+
+        normalized = text
+        start = normalized.find(heading)
+        if start < 0:
+            return normalized.strip() if fallback_to_full else ""
+
+        block_start = start + len(heading)
+        rest = normalized[block_start:]
+
+        next_headers = ["REGISTERED OFFICE:", "FACTORY ADDRESS:"]
+        next_positions = [pos for header in next_headers for pos in [rest.find(header)] if pos >= 0]
+        end = min(next_positions) if next_positions else len(rest)
+        return rest[:end].strip()
+
+    @staticmethod
+    def _clean_nonempty_lines(value: str) -> list[str]:
+        return [line.strip() for line in value.splitlines() if line.strip()]
+
+    @staticmethod
+    def _common_prefix_lines(first: list[str], second: list[str]) -> list[str]:
+        prefix: list[str] = []
+        for left, right in zip(first, second):
+            if left.casefold() != right.casefold():
+                break
+            prefix.append(left)
+        return prefix
+
+    @staticmethod
+    def _split_org_and_address_lines(lines: list[str]) -> tuple[list[str], list[str]]:
+        if not lines:
+            return [], []
+
+        split_index = len(lines)
+        for index, line in enumerate(lines):
+            if QisApiPipeline._looks_like_address_or_contact_line(line):
+                split_index = index
+                break
+
+        if split_index <= 0:
+            return [], lines
+
+        return lines[:split_index], lines[split_index:]
+
+    @staticmethod
+    def _looks_like_address_or_contact_line(line: str) -> bool:
+        low = line.lower().strip()
+        if not low:
+            return False
+
+        if any(token in low for token in ("phone", "fax", "e-mail", "email", "website", "www.")):
+            return True
+
+        if re.search(r"\d", low):
+            return True
+
+        address_tokens = (
+            "plot",
+            "no.",
+            "road",
+            "street",
+            "area",
+            "city",
+            "state",
+            "district",
+            "province",
+            "postal",
+            "india",
+        )
+        return any(token in low for token in address_tokens)
 
     @staticmethod
     def _contains_qis_heading(pdf_path: Path) -> bool:
