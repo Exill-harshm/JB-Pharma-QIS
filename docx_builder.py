@@ -10,6 +10,9 @@ The auto-detected blocklist comes from pdf_extractor._build_noise_blocklist().
 import re
 import copy
 import os
+import json
+import subprocess
+import sys
 import docx
 from docx.oxml import OxmlElement
 import fitz
@@ -568,6 +571,570 @@ def _insert_p33_flow_diagram_image(doc, image_path: str, logger) -> bool:
     except Exception as e:
         logger.warning(f"Section 3.2.P.3.3: failed to insert flow diagram image: {e}")
     return False
+
+
+def _paragraph_from_xml(doc, paragraph_xml):
+    for paragraph in doc.paragraphs:
+        if paragraph._p == paragraph_xml:
+            return paragraph
+    return None
+
+
+def _find_section_block_after_anchor(doc, anchor_xml, *, want_table=False, paragraph_prefix: str = ""):
+    """
+    Finds the next paragraph/table after anchor within the same template section.
+    Stops when the next 2.3.* section heading is reached.
+    """
+    nxt = anchor_xml.getnext()
+    _NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    wanted_prefix = paragraph_prefix.strip().lower()
+
+    while nxt is not None:
+        tag = nxt.tag.split('}')[-1]
+        if tag == 'p':
+            text = ''.join(t.text or '' for t in nxt.iter(f'{{{_NS}}}t')).strip()
+            if text and TEMPLATE_SECTION_PATTERN.search(text):
+                return None
+            if not want_table:
+                if not wanted_prefix:
+                    if text:
+                        return _paragraph_from_xml(doc, nxt)
+                elif text.lower().startswith(wanted_prefix):
+                    return _paragraph_from_xml(doc, nxt)
+        elif tag == 'tbl' and want_table:
+            for table in doc.tables:
+                if table._tbl == nxt:
+                    return table
+        nxt = nxt.getnext()
+
+    return None
+
+
+def _set_cell_text(cell, value: str) -> None:
+    value = _clean_text(value)
+    if not cell.paragraphs:
+        cell.text = value
+        return
+    first = cell.paragraphs[0]
+    first.text = value
+    for extra in cell.paragraphs[1:]:
+        extra.text = ""
+
+
+def _clear_table_rows(table, keep_rows: int) -> None:
+    while len(table.rows) > keep_rows:
+        row = table.rows[-1]._tr
+        row.getparent().remove(row)
+    for row in table.rows[keep_rows:]:
+        for cell in row.cells:
+            _set_cell_text(cell, "")
+
+
+def _append_three_col_rows(table, rows) -> None:
+    start_row = 3
+    needed_rows = start_row + len(rows)
+    while len(table.rows) < needed_rows:
+        table.add_row()
+
+    for row_index in range(3, len(table.rows)):
+        for cell in table.rows[row_index].cells[:3]:
+            _set_cell_text(cell, "")
+
+    for offset, row_data in enumerate(rows):
+        row = table.rows[start_row + offset]
+        for idx, value in enumerate(row_data[:3]):
+            if idx < len(row.cells):
+                _set_cell_text(row.cells[idx], value)
+
+    while len(table.rows) > needed_rows:
+        row = table.rows[-1]._tr
+        row.getparent().remove(row)
+
+
+def _extract_s41_table_rows(pdf_path: str, logger):
+    """
+    Builds [test, acceptance criteria, analytical procedure] rows
+    from the open-part DMF specification table.
+    """
+    rows = []
+    seen = set()
+    doc = None
+
+    try:
+        doc = fitz.open(pdf_path)
+        for page in doc:
+            page_text = " ".join(page.get_text("text", sort=True).split()).lower()
+            if "drug mater file" not in page_text:
+                continue
+
+            try:
+                tables = page.find_tables().tables
+            except Exception:
+                tables = []
+
+            for table in tables:
+                raw_rows = table.extract()
+                if not raw_rows:
+                    continue
+
+                header_text = " ".join(
+                    _clean_text(str(cell or "")) for row in raw_rows[:2] for cell in row
+                ).lower()
+                if not any(token in header_text for token in ("acceptance criteria", "method", "test")):
+                    continue
+
+                for raw_row in raw_rows:
+                    cells = [str(cell or "") for cell in raw_row]
+                    if len(cells) >= 9:
+                        test = _clean_text(" ".join(cells[0:3]))
+                        method = _clean_text(" ".join(cells[3:6]))
+                        acceptance = _clean_text(" ".join(cells[6:9]))
+                    elif len(cells) >= 3:
+                        test = _clean_text(cells[0])
+                        method = _clean_text(cells[1])
+                        acceptance = _clean_text(cells[2])
+                    else:
+                        continue
+
+                    header_key = " ".join((test, method, acceptance)).lower()
+                    if (
+                        not header_key
+                        or (
+                            "test" in test.lower()
+                            and "method" in method.lower()
+                            and "acceptance" in acceptance.lower()
+                        )
+                    ):
+                        continue
+
+                    row_key = (test.lower(), acceptance.lower(), method.lower())
+                    if row_key in seen:
+                        continue
+                    seen.add(row_key)
+                    rows.append([test, acceptance, method])
+    except Exception as e:
+        logger.warning(f"Section 3.2.S.4.1: failed to extract structured table rows: {e}")
+    finally:
+        if doc is not None:
+            doc.close()
+
+    return rows
+
+
+def _populate_s41_template_section(doc, anchor_xml, pdf_path: str, logger) -> bool:
+    caption_para = _find_section_block_after_anchor(
+        doc, anchor_xml, want_table=False, paragraph_prefix="api specifications of the api manufacturer"
+    )
+    table = _find_section_block_after_anchor(doc, anchor_xml, want_table=True)
+    if caption_para is None or table is None or len(table.rows) < 3:
+        return False
+
+    caption_text = " ".join((caption_para.text or "").split())
+    if caption_text and not caption_text.lower().startswith("(a)"):
+        caption_para.text = f"(a) {caption_text}"
+
+    _set_cell_text(table.rows[0].cells[-1], "USP")
+    _set_cell_text(table.rows[1].cells[-1], "-----")
+    _set_cell_text(table.rows[2].cells[0], "Test")
+    _set_cell_text(table.rows[2].cells[1], "Acceptance criteria")
+    _set_cell_text(table.rows[2].cells[2], "Analytical procedure\n(Type/Source/Version)")
+
+    rows = _extract_s41_table_rows(pdf_path, logger)
+    if not rows:
+        logger.warning("Section 3.2.S.4.1: no structured rows found for template table.")
+        return True
+
+    _append_three_col_rows(table, rows)
+    logger.info(f"Section 3.2.S.4.1: populated template specification table with {len(rows)} row(s).")
+    return True
+
+
+def _extract_p334_controls_rows(pdf_path: str, logger):
+    """
+    Groups critical control rows into [step, controls summary] pairs
+    for the 2-column template scaffold.
+    """
+    grouped = []
+    doc = None
+
+    try:
+        doc = fitz.open(pdf_path)
+        source_rows = None
+
+        for page in doc:
+            try:
+                tables = page.find_tables().tables
+            except Exception:
+                tables = []
+
+            for table in tables:
+                rows = table.extract()
+                if not rows:
+                    continue
+                header = " ".join(_clean_text(str(cell or "")) for cell in rows[0]).lower()
+                if (
+                    "process step" in header
+                    and "test to be performed" in header
+                    and "acceptance criteria" in header
+                ):
+                    source_rows = rows
+                    break
+            if source_rows:
+                break
+
+        if not source_rows:
+            return grouped
+
+        current_step = ""
+        current_controls = []
+
+        def flush():
+            nonlocal current_step, current_controls
+            if current_step and current_controls:
+                grouped.append([current_step, "\n".join(current_controls)])
+            current_step = ""
+            current_controls = []
+
+        for raw_row in source_rows[1:]:
+            cells = [_clean_text(str(cell or "")) for cell in raw_row]
+            if len(cells) < 4:
+                continue
+            step = cells[1]
+            test = cells[2]
+            acceptance = cells[3]
+
+            if step:
+                flush()
+                current_step = step
+
+            if not current_step or not test:
+                continue
+
+            line = f"{test}: {acceptance}" if acceptance else test
+            current_controls.append(line)
+
+        flush()
+    except Exception as e:
+        logger.warning(f"Section 3.2.P.3.4: failed to extract control rows: {e}")
+    finally:
+        if doc is not None:
+            doc.close()
+
+    if not grouped:
+        try:
+            helper_code = r"""
+import fitz, json, re, sys
+pdf_path = sys.argv[1]
+doc = fitz.open(pdf_path)
+grouped = []
+source_rows = None
+for page in doc:
+    try:
+        tables = page.find_tables().tables
+    except Exception:
+        tables = []
+    for table in tables:
+        rows = table.extract()
+        if not rows:
+            continue
+        header = " ".join(re.sub(r"\s+", " ", str(cell or "")).strip(" .:\n\t") for cell in rows[0]).lower()
+        if "process step" in header and "test to be performed" in header and "acceptance criteria" in header:
+            source_rows = rows
+            break
+    if source_rows:
+        break
+
+current_step = ""
+current_controls = []
+for raw_row in source_rows[1:] if source_rows else []:
+    cells = [re.sub(r"\s+", " ", str(cell or "")).strip(" .:\n\t") for cell in raw_row]
+    if len(cells) < 4:
+        continue
+    step = cells[1]
+    test = cells[2]
+    acceptance = cells[3]
+    if step:
+        if current_step and current_controls:
+            grouped.append([current_step, "\n".join(current_controls)])
+        current_step = step
+        current_controls = []
+    if current_step and test:
+        current_controls.append(f"{test}: {acceptance}" if acceptance else test)
+if current_step and current_controls:
+    grouped.append([current_step, "\n".join(current_controls)])
+print(json.dumps(grouped, ensure_ascii=False))
+"""
+            completed = subprocess.run(
+                [sys.executable, "-c", helper_code, pdf_path],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            if completed.returncode == 0 and completed.stdout.strip():
+                grouped = json.loads(completed.stdout)
+                if grouped:
+                    logger.info("Section 3.2.P.3.4: recovered control rows via fresh-process fallback.")
+        except Exception as e:
+            logger.warning(f"Section 3.2.P.3.4: fresh-process fallback failed: {e}")
+
+    return grouped
+
+
+def _populate_p334_template_section(doc, anchor_xml, pdf_path: str, logger) -> bool:
+    table = _find_section_block_after_anchor(doc, anchor_xml, want_table=True)
+    if table is None or len(table.columns) < 2:
+        return False
+
+    rows = _extract_p334_controls_rows(pdf_path, logger)
+    if not rows:
+        logger.warning("Section 3.2.P.3.4: no critical-control rows found for template table.")
+        return False
+
+    while len(table.rows) > 1:
+        row = table.rows[-1]._tr
+        row.getparent().remove(row)
+
+    for step, controls in rows:
+        row = table.add_row()
+        _set_cell_text(row.cells[0], step)
+        _set_cell_text(row.cells[1], controls)
+
+    logger.info(f"Section 3.2.P.3.4: populated template control table with {len(rows)} row(s).")
+    return True
+
+
+def _extract_restricted_dmf_note(pdf_path: str, logger) -> str:
+    doc = None
+    try:
+        doc = fitz.open(pdf_path)
+        text = "\n".join(page.get_text("text", sort=True) for page in doc)
+        match = re.search(
+            r"(As restricted part of Drug Master File of [A-Za-z0-9\-\s\(\)]+[\.]?)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            return _clean_text(match.group(1))
+    except Exception as e:
+        logger.warning(f"Section 3.2.S.2.3: failed to extract restricted DMF note: {e}")
+    finally:
+        if doc is not None:
+            doc.close()
+    return ""
+
+
+def _populate_s223_template_section(doc, anchor_xml, pdf_path: str, logger) -> bool:
+    note = _extract_restricted_dmf_note(pdf_path, logger)
+    if not note:
+        return False
+
+    a_para = _find_section_block_after_anchor(doc, anchor_xml, want_table=False, paragraph_prefix="(a)")
+    b_para = _find_section_block_after_anchor(doc, anchor_xml, want_table=False, paragraph_prefix="(b)")
+    if a_para is None or b_para is None:
+        return False
+
+    base_a = " ".join((a_para.text or "").split())
+    base_b = " ".join((b_para.text or "").split())
+    if note.lower() not in base_a.lower():
+        a_para.text = f"{base_a} {note}"
+    if note.lower() not in base_b.lower():
+        b_para.text = f"{base_b} {note}"
+
+    logger.info("Section 3.2.S.2.3: populated template material-control placeholders from restricted DMF note.")
+    return True
+
+
+def _prefix_s41_heading(doc, anchor_xml, logger) -> None:
+    desired_text = "(a) API specifications of the API manufacturer:"
+    desired_key = re.sub(r"\s+", " ", desired_text).strip().lower()
+
+    def _next_section_paragraph_xml(start_xml):
+        _NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+        nxt = start_xml.getnext()
+        while nxt is not None:
+            tag = nxt.tag.split('}')[-1]
+            if tag == 'p':
+                text = ''.join(t.text or '' for t in nxt.iter(f'{{{_NS}}}t')).strip()
+                if text and TEMPLATE_SECTION_PATTERN.search(text):
+                    return nxt
+            nxt = nxt.getnext()
+        return None
+
+    def _remove_duplicate_heading_paragraphs(start_xml):
+        _NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+        next_section = _next_section_paragraph_xml(start_xml)
+        nxt = start_xml.getnext()
+        matches = []
+        while nxt is not None and nxt is not next_section:
+            if nxt.tag.split('}')[-1] == 'p':
+                text = ''.join(t.text or '' for t in nxt.iter(f'{{{_NS}}}t')).strip()
+                text_key = re.sub(r"\s+", " ", text).strip().lower()
+                if text_key == desired_key:
+                    matches.append(nxt)
+            nxt = nxt.getnext()
+
+        for duplicate_xml in matches[1:]:
+            parent = duplicate_xml.getparent()
+            if parent is not None:
+                parent.remove(duplicate_xml)
+        return len(matches)
+
+    paragraph = _find_section_block_after_anchor(
+        doc,
+        anchor_xml,
+        want_table=False,
+        paragraph_prefix="api specifications of the api manufacturer",
+    )
+
+    first_table = _find_section_block_after_anchor(doc, anchor_xml, want_table=True)
+    if first_table is None:
+        return
+
+    if paragraph is not None:
+        text = " ".join((paragraph.text or "").split())
+        if text != desired_text:
+            paragraph.text = desired_text
+            logger.info("Section 3.2.S.4.1: restored heading before first extracted table.")
+        count = _remove_duplicate_heading_paragraphs(anchor_xml)
+        if count > 1:
+            logger.info("Section 3.2.S.4.1: removed duplicate heading paragraphs.")
+        return
+
+    table_xml = first_table._tbl
+    new_para = OxmlElement('w:p')
+    new_run = OxmlElement('w:r')
+    new_text = OxmlElement('w:t')
+    new_text.text = desired_text
+    new_run.append(new_text)
+    new_para.append(new_run)
+    table_xml.addprevious(new_para)
+    _remove_duplicate_heading_paragraphs(anchor_xml)
+    logger.info("Section 3.2.S.4.1: inserted missing heading before first extracted table.")
+
+
+def _normalize_s41_first_table(doc, anchor_xml, logger) -> None:
+    def _iter_section_tables():
+        nxt = anchor_xml.getnext()
+        _NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+        while nxt is not None:
+            tag = nxt.tag.split('}')[-1]
+            if tag == 'p':
+                text = ''.join(t.text or '' for t in nxt.iter(f'{{{_NS}}}t')).strip()
+                if text and TEMPLATE_SECTION_PATTERN.search(text):
+                    break
+            elif tag == 'tbl':
+                for table in doc.tables:
+                    if table._tbl == nxt:
+                        yield table
+                        break
+            nxt = nxt.getnext()
+
+    def _norm(text: str) -> str:
+        return re.sub(r"\s+", " ", text or "").strip().lower()
+
+    def _method_score(values) -> int:
+        score = 0
+        for value in values:
+            low = _norm(value)
+            if any(token in low for token in ("hplc", "gc", "visual", "colorimetry", "conductivity", "ph meter", "ir spectrum", "method", "usp", "positive reaction", "781s")):
+                score += 1
+        return score
+
+    def _acceptance_score(values) -> int:
+        score = 0
+        for value in values:
+            low = _norm(value)
+            if any(token in low for token in ("nmt", "between", "not more", "should be", "white to", "very soluble", "transparent", "colorless", "impurity", "cfu", "eu/", "%", "powder")):
+                score += 1
+        return score
+
+    def _swap_table_columns(table) -> None:
+        ns = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+        for tr in table._tbl.findall(f'{{{ns}}}tr'):
+            cells = tr.findall(f'{{{ns}}}tc')
+            if len(cells) < 3:
+                continue
+            left = copy.deepcopy(cells[1])
+            right = copy.deepcopy(cells[2])
+            tr.replace(cells[1], right)
+            tr.replace(cells[2], left)
+
+    swapped = 0
+    for table in _iter_section_tables():
+        if len(table.columns) < 3 or not table.rows:
+            continue
+
+        col2_values = [row.cells[1].text for row in table.rows[:12] if len(row.cells) >= 3]
+        col3_values = [row.cells[2].text for row in table.rows[:12] if len(row.cells) >= 3]
+        header = [_norm(cell.text) for cell in table.rows[0].cells[:3]]
+
+        should_swap = False
+        if "test" in header[0] and "method" in header[1] and "accept" in header[2]:
+            should_swap = True
+        elif "accept" in header[1] and ("analytical" in header[2] or "method" in header[2]):
+            should_swap = False
+        else:
+            if _method_score(col2_values) > _method_score(col3_values) and _acceptance_score(col3_values) >= _acceptance_score(col2_values):
+                should_swap = True
+
+        if not should_swap:
+            continue
+
+        _swap_table_columns(table)
+        swapped += 1
+
+        new_header = [_norm(cell.text) for cell in table.rows[0].cells[:3]]
+        if "test" in new_header[0]:
+            if len(table.rows[0].cells) >= 3:
+                _set_cell_text(table.rows[0].cells[0], "Test")
+                _set_cell_text(table.rows[0].cells[1], "Acceptance criteria")
+                _set_cell_text(table.rows[0].cells[2], "Analytical procedure\n(Type/Source/Version)")
+
+    if swapped:
+        logger.info(f"Section 3.2.S.4.1: swapped {swapped} extracted table(s) to template column order.")
+
+
+def _find_paragraph_by_prefix(doc, prefix: str):
+    wanted = prefix.strip().lower()
+    for paragraph in doc.paragraphs:
+        text = " ".join((paragraph.text or "").split()).lower()
+        if text.startswith(wanted):
+            return paragraph
+    return None
+
+
+def _postprocess_saved_docx(output_path: str, section_map: Dict[str, str], logger) -> None:
+    """
+    Re-open the saved output and re-apply fragile section normalizations.
+    Some table APIs behave more reliably on a fresh document load.
+    """
+    try:
+        doc = docx.Document(output_path)
+    except Exception as e:
+        logger.warning(f"Postprocess skipped for {output_path}: {e}")
+        return
+
+    touched = False
+
+    p334_heading = _find_paragraph_by_prefix(doc, "2.3.P.3.4 Controls of Critical Steps and Intermediates")
+    p334_pdf = section_map.get("3.2.P.3.4", "")
+    if p334_heading is not None and p334_pdf:
+        if _populate_p334_template_section(doc, p334_heading._p, p334_pdf, logger):
+            touched = True
+
+    s41_heading = _find_paragraph_by_prefix(doc, "2.3.S.4.1 Specification")
+    s41_pdf = section_map.get("3.2.S.4.1", "")
+    if s41_heading is not None and s41_pdf:
+        _prefix_s41_heading(doc, s41_heading._p, logger)
+        # Change col order :- 2.3.S.4.1
+        # _normalize_s41_first_table(doc, s41_heading._p, logger)
+        touched = True
+
+    if touched:
+        doc.save(output_path)
+        logger.info("Applied post-save section normalization.")
 
 
 def _element_text_content(element) -> str:
@@ -1222,6 +1789,24 @@ def process_template(
         )
 
         try:
+            current_anchor = paragraph._p
+
+            if section_num == "3.2.S.2.3":
+                paragraph.clear()
+                if _populate_s223_template_section(doc, current_anchor, pdf_path, logger):
+                    sections_filled += 1
+                    processed_sections.add(section_num)
+                    logger.info(f"Section {section_num}: populated successfully.")
+                    continue
+
+            if section_num == "3.2.P.3.4":
+                paragraph.clear()
+                if _populate_p334_template_section(doc, current_anchor, pdf_path, logger):
+                    sections_filled += 1
+                    processed_sections.add(section_num)
+                    logger.info(f"Section {section_num}: populated successfully.")
+                    continue
+
             content = extract_pdf_content(
                 pdf_path            = pdf_path,
                 log_folder          = log_folder,
@@ -1230,7 +1815,6 @@ def process_template(
                 section_start_pages = section_start_pages,
             )
 
-            current_anchor = paragraph._p
             if section_num == "3.2.S.6":
                 # For this section, inject AFTER the static template description line.
                 paragraph_index = None
@@ -1261,6 +1845,32 @@ def process_template(
 
             if content.docx_path and os.path.exists(content.docx_path):
                 template_section = _find_template_section_for_paragraph(paragraph)
+                handled_by_template_fill = False
+                if section_num == "3.2.S.2.3":
+                    handled_by_template_fill = _populate_s223_template_section(
+                        doc=doc,
+                        anchor_xml=current_anchor,
+                        pdf_path=pdf_path,
+                        logger=logger,
+                    )
+                elif section_num == "3.2.P.3.4":
+                    handled_by_template_fill = _populate_p334_template_section(
+                        doc=doc,
+                        anchor_xml=current_anchor,
+                        pdf_path=pdf_path,
+                        logger=logger,
+                    )
+
+                if handled_by_template_fill:
+                    try:
+                        os.remove(content.docx_path)
+                    except Exception:
+                        pass
+                    sections_filled += 1
+                    processed_sections.add(section_num)
+                    logger.info(f"Section {section_num}: populated successfully.")
+                    continue
+
                 if template_section == "2.3.S.4.1":
                     _remove_tables_until_next_section(
                         anchor_xml=current_anchor,
@@ -1307,6 +1917,9 @@ def process_template(
                         anchor_xml=current_anchor,
                         lines=2
                     )
+                    _prefix_s41_heading(doc, paragraph._p, logger)
+                    # Change col order :- 2.3.S.4.1
+                    # _normalize_s41_first_table(doc, paragraph._p, logger)
                 try:
                     os.remove(content.docx_path)
                 except Exception:
@@ -1359,6 +1972,7 @@ def process_template(
 
         logger.info(f"Saving output to {output_path}")
         doc.save(output_path)
+        _postprocess_saved_docx(output_path, section_map, logger)
     except Exception as e:
         logger.error(f"Failed to save: {e}")
         raise
