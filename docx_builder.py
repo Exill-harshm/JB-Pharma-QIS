@@ -4,13 +4,14 @@ Responsibility: Opens QIS template DOCX, finds all "Refer Section X.X.X"
 placeholders, injects extracted PDF content (text + tables),
 cleans injected noise (headers/footers/page numbers), saves output DOCX.
 
-Noise detection is fully automatic — no hardcoded company names.
+Noise detection is fully automatic â€” no hardcoded company names.
 The auto-detected blocklist comes from pdf_extractor._build_noise_blocklist().
 """
 import re
 import copy
 import os
 import docx
+from docx.oxml import OxmlElement
 import fitz
 from docx.shared import RGBColor, Inches
 from typing import Dict, Set
@@ -20,11 +21,15 @@ PLACEHOLDER_PATTERN = re.compile(
     r"Refer\s+(?:the\s+)?section\s+(\d+(?:\.[a-zA-Z0-9]+)+)",
     re.IGNORECASE
 )
+TEMPLATE_SECTION_PATTERN = re.compile(
+    r"^\s*(2\.3\.[SP](?:\.[A-Za-z0-9]+)*)\b",
+    re.IGNORECASE
+)
 
 MANUAL_ENTRY_SECTIONS = {'1.2', '1.3', '1.4', '1.5', '1.5.1', '1.5.2', '1.6'}
 OVERLAY_MANAGED_SECTIONS = {'3.2.S.2.1', '3.2.P.3.1'}
 
-# Generic regex patterns — work for ANY document, no company-specific strings
+# Generic regex patterns â€” work for ANY document, no company-specific strings
 _PAGE_NUM_RE = re.compile(r'^\d{1,4}$')
 _PAGE_OF_RE  = re.compile(r'^\d+\s+of\s+\d+\s*$', re.IGNORECASE)
 
@@ -35,7 +40,7 @@ def _remove_noise_tables(doc, logger) -> int:
     def _wt(elem):
         return ''.join(t.text or '' for t in elem.iter(f'{{{_NS}}}t')).strip()
 
-    # All paragraph texts — used to detect 1x1 header tables
+    # All paragraph texts â€” used to detect 1x1 header tables
     all_para_texts = {p.text.strip() for p in doc.paragraphs if p.text.strip()}
 
     def _is_noise(elem):
@@ -43,6 +48,22 @@ def _remove_noise_tables(doc, logger) -> int:
         clean = re.sub(r'\s+', '', text)
         rows = len(elem.findall(f'.//{{{_NS}}}tr'))
         cols = len(elem.findall(f'{{{_NS}}}tr/{{{_NS}}}tc'))
+        lower_text = text.lower()
+
+        # Never delete likely specification/result tables.
+        protected_markers = (
+            'specification',
+            'acceptance criteria',
+            'analytical procedure',
+            'test',
+            'impurities',
+            'assay',
+            'description',
+            'identification',
+        )
+        if any(marker in lower_text for marker in protected_markers):
+            return False
+
         if not clean:                                                   return True  # empty
         if re.match(r'^\d{1,4}$', text):                               return True  # "42"
         if re.match(r'^\d+\s+of\s+\d+$', text, re.I):                 return True  # "3 of 6"
@@ -91,7 +112,7 @@ def _collapse_blank_paragraphs(doc, logger) -> int:
     return len(to_remove)
 
 def _fix_zero_width_tables(doc, logger) -> int:
-    """Fixes tables injected by pdf2docx with tblW=0 — they render as blank boxes."""
+    """Fixes tables injected by pdf2docx with tblW=0 â€” they render as blank boxes."""
     _NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
     PAGE_WIDTH_DXA = '9026'  # A4 with standard margins
     fixed = 0
@@ -206,12 +227,12 @@ def _remove_empty_visual_tables(doc, logger) -> int:
 
         # KEY LOGIC
         if total_cells > 4 and text_cells == 0:
-            # completely empty table → remove
+            # completely empty table â†’ remove
             table._element.getparent().remove(table._element)
             removed += 1
 
         elif total_cells > 6 and (empty_cells / total_cells) > 0.8:
-            # mostly empty → also remove
+            # mostly empty â†’ also remove
             table._element.getparent().remove(table._element)
             removed += 1
 
@@ -302,8 +323,8 @@ def _is_noise_paragraph(text: str, blocklist: Set[str]) -> bool:
     if compact in {'cckedby', 'checkedby'}:
         return True
 
-    # Layer 3: very short ALL-CAPS lines — running header artefacts
-    # (e.g. "INTRODUCTION", "MODULE 3") — only strip if <= 3 words & < 25 chars
+    # Layer 3: very short ALL-CAPS lines â€” running header artefacts
+    # (e.g. "INTRODUCTION", "MODULE 3") â€” only strip if <= 3 words & < 25 chars
     if len(text) < 25 and text.isupper() and len(text.split()) <= 3:
         return True
 
@@ -318,7 +339,7 @@ def _is_footer_table_row(row, blocklist: Set[str]) -> bool:
     - At least one cell matches the auto-detected blocklist, AND
     - Every other non-empty cell is a bare page number.
 
-    This is fully generic — no company names needed.
+    This is fully generic â€” no company names needed.
     """
     cell_texts = [cell.text.strip() for cell in row.cells]
     if not any(cell_texts):
@@ -332,7 +353,7 @@ def _is_footer_table_row(row, blocklist: Set[str]) -> bool:
         if norm in blocklist:
             has_blocklist_hit = True
         elif not (_PAGE_NUM_RE.match(t) and t.isdigit() and int(t) < 10000):
-            # This cell has real content — row is NOT a footer
+            # This cell has real content â€” row is NOT a footer
             return False
 
     return has_blocklist_hit
@@ -346,7 +367,7 @@ def _clean_injected_content(
 ):
     """
     Cleans noise from pdf2docx-converted DOCX BEFORE injecting into template.
-    Uses the auto-detected blocklist — no hardcoded company strings.
+    Uses the auto-detected blocklist â€” no hardcoded company strings.
     """
     removed = 0
 
@@ -598,7 +619,6 @@ def _strip_drawing_elements(element):
             except Exception:
                 pass
 
-
 def _analyze_injected_doc_layout(src_doc) -> dict:
     """Computes simple structure metrics used to decide table auto-inclusion."""
     body_elements = [
@@ -825,6 +845,371 @@ def _drop_outlier_table_schemas(src_doc, logger, section_num: str) -> int:
     return removed
 
 
+def _merge_split_tables(src_doc, logger, section_num: str) -> int:
+    """
+    Merge consecutive table fragments (typically split by PDF page breaks)
+    when both parts have the same column count.
+    """
+    if section_num == "3.2.S.4.1":
+        return 0
+
+    body = src_doc.element.body
+    elements = list(body)
+    merged = 0
+
+    def _tag_name(el) -> str:
+        return el.tag.split('}')[-1]
+
+    def _is_blank_paragraph(el) -> bool:
+        if _tag_name(el) != 'p':
+            return False
+        _NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+        txt = ''.join(t.text or '' for t in el.iter(f'{{{_NS}}}t')).strip()
+        return txt == ""
+
+    i = 0
+    while i < len(elements) - 1:
+        first = elements[i]
+        if _tag_name(first) != 'tbl':
+            i += 1
+            continue
+
+        j = i + 1
+        while j < len(elements) and _is_blank_paragraph(elements[j]):
+            j += 1
+        if j >= len(elements):
+            break
+
+        second = elements[j]
+        if _tag_name(second) != 'tbl':
+            i = j
+            continue
+
+        rows_a = first.findall('.//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}tr')
+        rows_b = second.findall('.//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}tr')
+        if not rows_a or not rows_b:
+            i = j
+            continue
+
+        cols_a = len(rows_a[0].findall('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}tc'))
+        cols_b = len(rows_b[0].findall('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}tc'))
+        if cols_a != cols_b or cols_a == 0:
+            i = j
+            continue
+
+        # If the second table starts with a header row, skip that row.
+        def _row_text(row_el) -> str:
+            _NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+            return " ".join(
+                ''.join(t.text or '' for t in tc.iter(f'{{{_NS}}}t')).strip().lower()
+                for tc in row_el.findall(f'{{{_NS}}}tc')
+            )
+
+        start_idx = 0
+        first_row_text = _row_text(rows_b[0])
+        if (
+            'test' in first_row_text and
+            ('acceptance' in first_row_text or 'criteria' in first_row_text) and
+            ('method' in first_row_text or 'analytical procedure' in first_row_text)
+        ):
+            start_idx = 1
+
+        for row_el in rows_b[start_idx:]:
+            first.append(copy.deepcopy(row_el))
+
+        # Remove merged second table and any blank separator paragraphs.
+        body.remove(second)
+        for k in range(i + 1, j):
+            if k < len(elements) and _is_blank_paragraph(elements[k]):
+                try:
+                    body.remove(elements[k])
+                except Exception:
+                    pass
+
+        merged += 1
+        elements = list(body)
+        i = max(i - 1, 0)
+
+    if merged:
+        logger.info(f"Section {section_num}: merged {merged} split table fragment(s).")
+    return merged
+
+
+def _clean_text(text: str) -> str:
+    if not text:
+        return ""
+    text = text.replace("\r", "\n")
+    text = text.replace("\n", " ")
+    text = re.sub(r"\s+", " ", text)
+    text = text.strip()
+    # Remove leading punctuation artifacts like ": value"
+    text = re.sub(r'^\s*[:;\-]\s*', '', text)
+    # Ensure a space after period when OCR glues words: "sample.The"
+    text = re.sub(r'(?<=\w)\.(?=[A-Za-z])', '. ', text)
+    # Start bullets/numbered points on a new line.
+    text = re.sub(r'\s*[â€¢â—â–ªâ—¦]\s*', '\nâ€¢ ', text)
+    text = re.sub(r'(?<!^)\s+(?=(\d{1,2}[.)]\s+))', '\n', text)
+    text = re.sub(r'(?<!^)\s+(?=([A-Za-z][.)]\s+))', '\n', text)
+    text = re.sub(r'(?<!^)\s*-\s+(?=[A-Za-z])', '\n- ', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    text = re.sub(r"\s+", " ", text)
+    # Keep intentional line breaks created above.
+    text = re.sub(r' *\n *', '\n', text)
+    return text.strip()
+
+
+def _extract_scanned_spec_rows_with_camelot(pdf_path: str, logger):
+    """
+    Extracts scanned rows for section 2.3.S.4.1 using Camelot.
+    Looks for pages near 'Lists of Tests and/& Specification'.
+    Returns rows shaped as [Test, Acceptance criteria, Method].
+    """
+    try:
+        import fitz
+        import camelot
+    except Exception as e:
+        logger.warning(f"Camelot path unavailable for scanned table extraction: {e}")
+        return []
+
+    marker_patterns = [
+        re.compile(r'lists?\s+of\s+tests?\s*(?:and|&|/)?\s*specifications?', re.IGNORECASE),
+        re.compile(r'tests?\s*(?:&|and|/)\s*specifications?', re.IGNORECASE),
+    ]
+
+    marker_pages = []
+    try:
+        pdf = fitz.open(pdf_path)
+        for i, page in enumerate(pdf):
+            txt = " ".join(page.get_text().split())
+            if any(p.search(txt) for p in marker_patterns):
+                marker_pages.append(i + 1)  # Camelot uses 1-based pages
+        pdf.close()
+    except Exception as e:
+        logger.warning(f"Could not scan marker pages in {os.path.basename(pdf_path)}: {e}")
+        return []
+
+    if not marker_pages:
+        # Scanned PDFs often don't expose text to fitz; keep deterministic fallback.
+        pages = "2,3,4"
+        logger.info(
+            f"{os.path.basename(pdf_path)}: marker not found in text layer; "
+            f"using Camelot fallback pages {pages}."
+        )
+    else:
+        page_set = set()
+        for p in marker_pages:
+            page_set.add(p)
+            page_set.add(p + 1)
+            page_set.add(p + 2)
+        pages = ",".join(str(p) for p in sorted(page_set))
+
+    try:
+        tables = camelot.read_pdf(pdf_path, pages=pages, flavor="lattice")
+    except Exception as e:
+        logger.warning(f"Camelot failed on {os.path.basename(pdf_path)} pages {pages}: {e}")
+        return []
+
+    rows = []
+    seen = set()
+    seen_test_names = set()
+    exclude_tokens = [
+        "prepared by", "checked by", "approved by",
+        "product name", "module", "ref. no", "drug mater file",
+        "version", "date"
+    ]
+
+    for table in tables:
+        df = table.df
+        joined = " ".join(df.astype(str).values.flatten()).lower()
+        if any(tok in joined for tok in exclude_tokens):
+            continue
+
+        table_rows = []
+        for i in range(len(df)):
+            raw = [str(x).strip() for x in df.iloc[i].tolist()]
+            if all(not x for x in raw):
+                continue
+
+            if len(raw) >= 3:
+                test = _clean_text(raw[1])
+                spec = _clean_text(" ".join(raw[2:]))
+            elif len(raw) == 2:
+                test = _clean_text(raw[0])
+                spec = _clean_text(raw[1])
+            else:
+                continue
+
+            if test.lower() in {"", "tests", "test", "sr.", "no.", "s. no.", "s.no"}:
+                continue
+            if not spec:
+                continue
+
+            test_norm = re.sub(r'[^a-z0-9]+', '', test.lower())
+            if test_norm in seen_test_names:
+                continue
+
+            rec = (test, spec, "")
+            if rec not in seen:
+                table_rows.append([test, spec, ""])
+                seen_test_names.add(test_norm)
+
+        if not table_rows:
+            continue
+
+        for row in table_rows:
+            rec = (row[0], row[1], row[2])
+            if rec not in seen:
+                rows.append(row)
+                seen.add(rec)
+
+    if rows:
+        logger.info(
+            f"{os.path.basename(pdf_path)}: Camelot extracted {len(rows)} scanned rows."
+        )
+    return rows
+
+
+def _append_rows_as_table(doc, current_anchor, headers, rows, force_new_table=False, insert_page_break=False):
+    """
+    Appends rows into existing anchor table when possible to preserve format.
+    Falls back to creating a new table only if no suitable anchor table exists.
+    Returns new anchor.
+    """
+    if not rows:
+        return current_anchor
+
+    # Find the preceding table for deduplication regardless of if we're appending to it.
+    reference_table = None
+    if hasattr(current_anchor, "tag") and current_anchor.tag.endswith("}tbl"):
+        for t in doc.tables:
+            if t._tbl == current_anchor and len(t.columns) >= len(headers):
+                reference_table = t
+                break
+
+    anchor_table = reference_table if not force_new_table else None
+
+    def _norm_key(s: str) -> str:
+        return re.sub(r'[^a-z0-9]+', ' ', (s or '').lower()).strip()
+
+    # Drop duplicates already present in reference table by first-column key.
+    filtered_rows = rows[:]
+    if reference_table is not None:
+        existing_first_col = set()
+        for r_idx, r in enumerate(reference_table.rows):
+            if r_idx == 0:
+                continue
+            if not r.cells:
+                continue
+            k = _norm_key(r.cells[0].text)
+            if k:
+                existing_first_col.add(k)
+
+        unique_rows = []
+        seen_new = set()
+        for row in filtered_rows:
+            first_key = _norm_key(str(row[0]) if row else "")
+            if not first_key:
+                continue
+            if first_key in existing_first_col or first_key in seen_new:
+                continue
+            unique_rows.append(row)
+            seen_new.add(first_key)
+        filtered_rows = unique_rows
+
+    if not filtered_rows:
+        return current_anchor
+
+    if anchor_table is not None:
+        for row in filtered_rows:
+            cells = anchor_table.add_row().cells
+            for j, val in enumerate(row):
+                if j < len(cells):
+                    cells[j].text = _clean_text(str(val))
+        return current_anchor
+
+    temp_table = doc.add_table(rows=len(filtered_rows) + 1, cols=len(headers))
+    temp_table.style = "Table Grid"
+    for j, col in enumerate(headers):
+        run = temp_table.cell(0, j).paragraphs[0].add_run(col)
+        run.bold = True
+    for i, row in enumerate(filtered_rows, start=1):
+        for j, val in enumerate(row):
+            temp_table.cell(i, j).text = _clean_text(str(val))
+
+    new_tbl = copy.deepcopy(temp_table._tbl)
+    # Keep visual separation from previous content.
+    gap_anchor = current_anchor
+    for _ in range(4):
+        new_p = OxmlElement('w:p')
+        gap_anchor.addnext(new_p)
+        gap_anchor = new_p
+    gap_anchor.addnext(new_tbl)
+    temp_table._tbl.getparent().remove(temp_table._tbl)
+    return new_tbl
+
+
+def _remove_tables_until_next_section(anchor_xml, logger, section_num: str) -> int:
+    """
+    Removes table scaffolds after current anchor until next section heading
+    paragraph is reached (e.g., next 2.3.S/P.* heading).
+    """
+    removed = 0
+    removed_paras = 0
+    nxt = anchor_xml.getnext()
+    _NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    removed_other = 0
+
+    while nxt is not None:
+        tag = nxt.tag.split('}')[-1]
+        if tag == 'p':
+            text = ''.join(t.text or '' for t in nxt.iter(f'{{{_NS}}}t')).strip()
+            if text and TEMPLATE_SECTION_PATTERN.search(text):
+                break
+            parent = nxt.getparent()
+            to_remove = nxt
+            nxt = nxt.getnext()
+            if parent is not None:
+                parent.remove(to_remove)
+                removed_paras += 1
+            continue
+        elif tag == 'tbl':
+            parent = nxt.getparent()
+            to_remove = nxt
+            nxt = nxt.getnext()
+            if parent is not None:
+                parent.remove(to_remove)
+                removed += 1
+            continue
+        else:
+            # Remove any other block-level leftovers in this section region.
+            parent = nxt.getparent()
+            to_remove = nxt
+            nxt = nxt.getnext()
+            if parent is not None:
+                parent.remove(to_remove)
+                removed_other += 1
+            continue
+        nxt = nxt.getnext()
+
+    if removed or removed_paras or removed_other:
+        logger.info(
+            f"Section {section_num}: removed {removed} scaffold table(s) and "
+            f"{removed_paras} scaffold paragraph(s) and "
+            f"{removed_other} other scaffold block(s)."
+        )
+    return removed
+
+
+def _add_section_spacing(anchor_xml, lines: int = 2):
+    """Adds blank paragraph lines after current section content."""
+    curr = anchor_xml
+    for _ in range(max(0, lines)):
+        p = OxmlElement('w:p')
+        curr.addnext(p)
+        curr = p
+    return curr
+
+
 def _inject_docx_content(
     src_docx_path: str,
     anchor_p_xml,
@@ -832,6 +1217,8 @@ def _inject_docx_content(
     logger,
     section_num: str,
     include_pdf_tables: bool = False,
+    table_only: bool = False,
+    table_text_keyword: str = ""
 ):
     """
     Opens pdf2docx temp DOCX, cleans noise, copies body elements
@@ -848,6 +1235,7 @@ def _inject_docx_content(
         return current_anchor
 
     _clean_injected_content(src_doc, blocklist, logger, section_num)
+    _merge_split_tables(src_doc, logger, section_num)
 
     effective_include_pdf_tables = include_pdf_tables
     suppress_paragraphs = False
@@ -868,13 +1256,65 @@ def _inject_docx_content(
     inserted_nonblank = False
     pending_blank_para = None
 
-    for element in src_doc.element.body:
+    table_count = 0
+    keyword = table_text_keyword.strip().lower()
+
+    def _element_text(element) -> str:
+        _NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+        return ''.join(t.text or '' for t in element.iter(f'{{{_NS}}}t')).strip()
+
+    body_elements = list(src_doc.element.body)
+
+    def _prev_non_empty_paragraph_text(elements, idx: int) -> str:
+        _NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+        for k in range(idx - 1, -1, -1):
+            el = elements[k]
+            tag = el.tag.split('}')[-1]
+            if tag != 'p':
+                continue
+            txt = ''.join(t.text or '' for t in el.iter(f'{{{_NS}}}t')).strip()
+            if txt:
+                return txt
+        return ""
+
+    for idx, element in enumerate(body_elements):
         if element.tag.endswith('}sectPr') or element.tag == 'sectPr':
             continue
-        if not effective_include_pdf_tables and element.tag.split('}')[-1] == 'tbl':
+
+        is_table = element.tag.endswith('}tbl') or element.tag == 'tbl'
+        tag_name = element.tag.split('}')[-1]
+
+        if table_only:
+            if not is_table:
+                continue
+        elif not effective_include_pdf_tables and is_table:
             continue
 
-        tag_name = element.tag.split('}')[-1]
+        if table_only and keyword and is_table:
+            table_text = " ".join(_element_text(element).split())
+            table_text_lower = table_text.lower()
+            caption_text = _prev_non_empty_paragraph_text(body_elements, idx)
+            caption_text_lower = " ".join(caption_text.lower().split())
+
+            # Exclude DMF header metadata tables.
+            is_dmf_header_table = (
+                'drug mater file' in table_text_lower or
+                (
+                    'product name' in table_text_lower and
+                    'module:' in table_text_lower and
+                    'version' in table_text_lower
+                )
+            )
+            if is_dmf_header_table:
+                continue
+
+            has_keyword = (
+                (keyword in table_text_lower) or
+                (keyword in caption_text_lower)
+            )
+            if not has_keyword:
+                continue
+
         if tag_name == 'p':
             if suppress_paragraphs:
                 continue
@@ -894,7 +1334,6 @@ def _inject_docx_content(
                 except Exception:
                     pass
                 pending_blank_para = None
-
         try:
             new_el = copy.deepcopy(element)
             _strip_drawing_elements(new_el)
@@ -902,10 +1341,19 @@ def _inject_docx_content(
             current_anchor = new_el
             if tag_name == 'p' and _element_text_content(new_el):
                 inserted_nonblank = True
+            if is_table:
+                table_count += 1
         except Exception as el_e:
             logger.warning(
                 f"Skipped element for section {section_num}: {el_e}"
             )
+
+    if table_only and table_count == 0:
+        logger.warning(
+            f"Section {section_num}: no table containing keyword "
+            f"'{table_text_keyword}' found. "
+            f"No fallback to full content."
+        )
 
     return current_anchor
 
@@ -919,6 +1367,9 @@ def process_template(
     section_start_pages: Dict[str, int] = None,
     preserve_template_tables: bool = False,
     include_pdf_tables: bool = False,
+    table_only_sections: Set[str] = None,
+    table_only_all_sections: bool = False,
+    table_keyword_by_template_section: Dict[str, str] = None,
 ):
     """
     Main pipeline:
@@ -935,6 +1386,10 @@ def process_template(
         section_page_limits = {}
     if section_start_pages is None:
         section_start_pages = {}
+    if table_only_sections is None:
+        table_only_sections = set()
+    if table_keyword_by_template_section is None:
+        table_keyword_by_template_section = {}
 
     try:
         doc = docx.Document(template_path)
@@ -950,6 +1405,21 @@ def process_template(
     processed_sections = set()
 
     logger.info("Starting QIS template placeholder scan.")
+    body_paragraphs = list(doc.paragraphs)
+
+    def _find_template_section_for_paragraph(target_para) -> str:
+        idx = -1
+        for i, p in enumerate(body_paragraphs):
+            if p._p == target_para._p:
+                idx = i
+                break
+        if idx == -1:
+            return ""
+        for j in range(idx, -1, -1):
+            m = TEMPLATE_SECTION_PATTERN.search(body_paragraphs[j].text or "")
+            if m:
+                return m.group(1)
+        return ""
 
     for paragraph in _iter_all_paragraphs(doc):
         match = PLACEHOLDER_PATTERN.search(paragraph.text)
@@ -1046,6 +1516,22 @@ def process_template(
             paragraph.clear()
 
             if content.docx_path and os.path.exists(content.docx_path):
+                template_section = _find_template_section_for_paragraph(paragraph)
+                if template_section == "2.3.S.4.1":
+                    _remove_tables_until_next_section(
+                        anchor_xml=current_anchor,
+                        logger=logger,
+                        section_num=section_num
+                    )
+                table_keyword = table_keyword_by_template_section.get(
+                    template_section, ""
+                )
+                use_table_only = table_only_all_sections or (
+                    section_num in table_only_sections
+                )
+                if table_keyword:
+                    use_table_only = True
+                tables_before = len(doc.tables)
                 current_anchor = _inject_docx_content(
                     src_docx_path = content.docx_path,
                     anchor_p_xml  = current_anchor,
@@ -1053,7 +1539,30 @@ def process_template(
                     logger        = logger,
                     section_num   = section_num,
                     include_pdf_tables = include_pdf_tables,
+                    table_only    = use_table_only,
+                    table_text_keyword = table_keyword
                 )
+                tables_after = len(doc.tables)
+                injected_table_count = tables_after - tables_before
+
+                # Extra Camelot extraction for scanned table near
+                # "Lists of Tests and/& Specification" in API spec sections.
+                if template_section == "2.3.S.4.1":
+                    scanned_rows = _extract_scanned_spec_rows_with_camelot(
+                        pdf_path, logger
+                    )
+                    current_anchor = _append_rows_as_table(
+                        doc=doc,
+                        current_anchor=current_anchor,
+                        headers=["Test", "Acceptance criteria", "Method"],
+                        rows=scanned_rows,
+                        force_new_table=True,
+                        insert_page_break=True
+                    )
+                    current_anchor = _add_section_spacing(
+                        anchor_xml=current_anchor,
+                        lines=2
+                    )
                 try:
                     os.remove(content.docx_path)
                 except Exception:
