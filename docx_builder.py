@@ -619,6 +619,231 @@ def _strip_drawing_elements(element):
             except Exception:
                 pass
 
+def _analyze_injected_doc_layout(src_doc) -> dict:
+    """Computes simple structure metrics used to decide table auto-inclusion."""
+    body_elements = [
+        elem for elem in src_doc.element.body
+        if elem.tag.split('}')[-1] != 'sectPr'
+    ]
+
+    table_count = 0
+    rich_table_count = 0
+    table_text_chars = 0
+    nonblank_paragraph_count = 0
+
+    for elem in body_elements:
+        tag_name = elem.tag.split('}')[-1]
+        if tag_name == 'tbl':
+            table_count += 1
+            tbl_text = _element_text_content(elem)
+            table_text_chars += len(tbl_text)
+
+            rows = len(elem.findall('.//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}tr'))
+            first_row = elem.find('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}tr')
+            cols = len(first_row.findall('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}tc')) if first_row is not None else 0
+
+            if rows >= 8 and cols >= 3 and len(tbl_text) >= 250:
+                rich_table_count += 1
+        elif tag_name == 'p':
+            if _element_text_content(elem):
+                nonblank_paragraph_count += 1
+
+    return {
+        "table_count": table_count,
+        "rich_table_count": rich_table_count,
+        "table_text_chars": table_text_chars,
+        "nonblank_paragraph_count": nonblank_paragraph_count,
+    }
+
+
+def _should_auto_include_tables(layout: dict) -> bool:
+    """
+    Enables table injection for table-dominant converted sections.
+    Keeps behavior generic and avoids section-specific hardcoding.
+    """
+    return (
+        layout.get("rich_table_count", 0) >= 2
+        and layout.get("table_count", 0) >= 2
+        and layout.get("table_text_chars", 0) >= 1000
+        and layout.get("nonblank_paragraph_count", 0) <= 4
+    )
+
+
+def _table_header_signature(table_element) -> str:
+    """Builds a normalized signature from the first row of a table element."""
+    _NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    first_row = table_element.find(f'{{{_NS}}}tr')
+    if first_row is None:
+        return ""
+
+    cells = first_row.findall(f'{{{_NS}}}tc')
+    if not cells:
+        return ""
+
+    parts: list[str] = []
+    for cell in cells:
+        text = ''.join(t.text or '' for t in cell.iter(f'{{{_NS}}}t'))
+        norm = re.sub(r'\s+', ' ', text).strip().lower()
+        parts.append(norm)
+
+    non_empty = [p for p in parts if p]
+    if len(non_empty) < 2:
+        return ""
+    return '|'.join(parts)
+
+
+def _table_column_count(table_element) -> int:
+    _NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    first_row = table_element.find(f'{{{_NS}}}tr')
+    if first_row is None:
+        return 0
+    return len(first_row.findall(f'{{{_NS}}}tc'))
+
+
+def _drop_consecutive_duplicate_table_headers(src_doc, logger, section_num: str) -> int:
+    """
+    Removes first-row headers that repeat across consecutive tables.
+    This handles PDF page-split continuation tables cleanly.
+    """
+    _NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    removed = 0
+    last_header_signature = ""
+
+    for element in src_doc.element.body:
+        if element.tag.split('}')[-1] != 'tbl':
+            continue
+
+        signature = _table_header_signature(element)
+        if not signature:
+            continue
+
+        rows = element.findall(f'{{{_NS}}}tr')
+        if (
+            last_header_signature
+            and signature == last_header_signature
+            and len(rows) > 1
+        ):
+            first_row = rows[0]
+            parent = first_row.getparent()
+            if parent is not None:
+                parent.remove(first_row)
+                removed += 1
+            continue
+
+        last_header_signature = signature
+
+    if removed:
+        logger.info(
+            f"Section {section_num}: removed {removed} repeated continuation table header row(s)."
+        )
+    return removed
+
+
+def _merge_consecutive_continuation_tables(src_doc, logger, section_num: str) -> int:
+    """
+    Merges consecutive tables that share the same column schema and are not
+    separated by non-empty paragraphs. This smooths page-break table splits.
+    """
+    _NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    merged = 0
+
+    previous_table = None
+    previous_cols = 0
+    paragraph_between = False
+
+    for elem in list(src_doc.element.body):
+        tag_name = elem.tag.split('}')[-1]
+
+        if tag_name == 'p':
+            if _element_text_content(elem):
+                paragraph_between = True
+            continue
+
+        if tag_name != 'tbl':
+            previous_table = None
+            previous_cols = 0
+            paragraph_between = False
+            continue
+
+        cols = _table_column_count(elem)
+        can_merge = (
+            previous_table is not None
+            and not paragraph_between
+            and cols > 0
+            and cols == previous_cols
+        )
+
+        if can_merge:
+            for row in elem.findall(f'{{{_NS}}}tr'):
+                previous_table.append(copy.deepcopy(row))
+
+            parent = elem.getparent()
+            if parent is not None:
+                parent.remove(elem)
+            merged += 1
+            paragraph_between = False
+            continue
+
+        previous_table = elem
+        previous_cols = cols
+        paragraph_between = False
+
+    if merged:
+        logger.info(
+            f"Section {section_num}: merged {merged} continuation table(s) across page breaks."
+        )
+    return merged
+
+
+def _drop_outlier_table_schemas(src_doc, logger, section_num: str) -> int:
+    """
+    Removes minority table schemas when one column layout clearly dominates.
+    This keeps page-split continuation tables and drops unrelated outlier tables.
+    """
+    from collections import Counter
+
+    table_elements = [
+        elem for elem in src_doc.element.body
+        if elem.tag.split('}')[-1] == 'tbl'
+    ]
+    if len(table_elements) < 3:
+        return 0
+
+    schema_by_table = []
+    for elem in table_elements:
+        first_row = elem.find('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}tr')
+        if first_row is None:
+            continue
+        cols = len(first_row.findall('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}tc'))
+        if cols <= 0:
+            continue
+        schema_by_table.append((elem, cols))
+
+    if len(schema_by_table) < 3:
+        return 0
+
+    freq = Counter(cols for _, cols in schema_by_table)
+    dominant_cols, dominant_count = max(freq.items(), key=lambda item: item[1])
+
+    if dominant_count < 2 or dominant_count == len(schema_by_table):
+        return 0
+
+    removed = 0
+    for elem, cols in schema_by_table:
+        if cols == dominant_cols:
+            continue
+        parent = elem.getparent()
+        if parent is not None:
+            parent.remove(elem)
+            removed += 1
+
+    if removed:
+        logger.info(
+            f"Section {section_num}: removed {removed} outlier table schema(s) "
+            f"(dominant columns={dominant_cols})."
+        )
+    return removed
+
 
 def _merge_split_tables(src_doc, logger, section_num: str) -> int:
     """
@@ -1012,6 +1237,22 @@ def _inject_docx_content(
     _clean_injected_content(src_doc, blocklist, logger, section_num)
     _merge_split_tables(src_doc, logger, section_num)
 
+    effective_include_pdf_tables = include_pdf_tables
+    suppress_paragraphs = False
+    if not include_pdf_tables:
+        layout = _analyze_injected_doc_layout(src_doc)
+        if _should_auto_include_tables(layout):
+            effective_include_pdf_tables = True
+            suppress_paragraphs = True
+            _drop_outlier_table_schemas(src_doc, logger, section_num)
+            _drop_consecutive_duplicate_table_headers(src_doc, logger, section_num)
+            _merge_consecutive_continuation_tables(src_doc, logger, section_num)
+            logger.info(
+                f"Section {section_num}: detected table-dominant content "
+                f"(tables={layout['table_count']}, rich_tables={layout['rich_table_count']}, "
+                f"table_chars={layout['table_text_chars']}). Injecting tables automatically."
+            )
+
     inserted_nonblank = False
     pending_blank_para = None
 
@@ -1046,7 +1287,7 @@ def _inject_docx_content(
         if table_only:
             if not is_table:
                 continue
-        elif not include_pdf_tables and is_table:
+        elif not effective_include_pdf_tables and is_table:
             continue
 
         if table_only and keyword and is_table:
@@ -1075,6 +1316,8 @@ def _inject_docx_content(
                 continue
 
         if tag_name == 'p':
+            if suppress_paragraphs:
+                continue
             if not _element_text_content(element):
                 # Drop leading blanks and compress internal blank runs.
                 if not inserted_nonblank:
@@ -1254,6 +1497,19 @@ def process_template(
                     for p in doc.paragraphs[paragraph_index + 1 : paragraph_index + 10]:
                         low = p.text.strip().lower()
                         if low.startswith("(b)") and "narrative description" in low:
+                            current_anchor = p._p
+                            break
+            elif section_num == "3.2.P.3.4":
+                # Insert extracted controls tables after the template (a) summary line.
+                paragraph_index = None
+                for idx, p in enumerate(doc.paragraphs):
+                    if p._p == paragraph._p:
+                        paragraph_index = idx
+                        break
+                if paragraph_index is not None:
+                    for p in doc.paragraphs[paragraph_index + 1 : paragraph_index + 14]:
+                        low = p.text.strip().lower()
+                        if low.startswith("(a)") and "summary of controls performed at the critical steps" in low:
                             current_anchor = p._p
                             break
 
