@@ -9,6 +9,13 @@ from .models import ApiInfo, ManufactureInfo, P31ManufacturerInfo, SummaryInfo
 
 
 class QisDocxFiller:
+    @staticmethod
+    def _row_cells(row):
+        try:
+            return tuple(row.cells)
+        except Exception:
+            return tuple()
+
     def fill(
         self,
         template_docx: Path,
@@ -58,24 +65,26 @@ class QisDocxFiller:
         # Clear only rows that have extracted source values.
         # This preserves static merged rows such as section headings.
         for row_index, row in enumerate(table.rows):
-            if not row.cells:
+            row_cells = self._row_cells(row)
+            if not row_cells:
                 continue
-            label_text = row.cells[0].text
+            label_text = row_cells[0].text
             values = self._lookup_summary_values(label_text, summary.summary_values_by_label)
             if not values:
                 continue
-            for col_index in range(1, len(row.cells)):
-                row.cells[col_index].text = ""
+            for col_index in range(1, len(row_cells)):
+                row_cells[col_index].text = ""
 
         for row_index, row in enumerate(table.rows):
-            if not row.cells:
+            row_cells = self._row_cells(row)
+            if not row_cells:
                 continue
-            label_text = row.cells[0].text
+            label_text = row_cells[0].text
             values = self._lookup_summary_values(label_text, summary.summary_values_by_label)
             if not values:
                 continue
 
-            for col_index in range(1, len(row.cells)):
+            for col_index in range(1, len(row_cells)):
                 source_index = col_index - 1
                 if source_index >= len(values):
                     continue
@@ -89,8 +98,9 @@ class QisDocxFiller:
         if len(doc.tables) > 2 and summary.related_row_values:
             related_table = doc.tables[2]
             if len(related_table.rows) > 1:
-                for col_index in range(len(related_table.rows[1].cells)):
-                    related_table.rows[1].cells[col_index].text = ""
+                second_row_cells = self._row_cells(related_table.rows[1])
+                for col_index in range(len(second_row_cells)):
+                    second_row_cells[col_index].text = ""
             for col_index, value in enumerate(summary.related_row_values[:4]):
                 self._set_text(related_table, 1, col_index, value)
             if len(related_table.rows) > 2:
@@ -123,16 +133,17 @@ class QisDocxFiller:
 
     def _fill_admin_summary_table(self, table, source_map: dict[str, list[str]]) -> None:
         for row_index, row in enumerate(table.rows):
-            if len(row.cells) < 2:
+            row_cells = self._row_cells(row)
+            if len(row_cells) < 2:
                 continue
-            label_text = row.cells[0].text
+            label_text = row_cells[0].text
             values = self._lookup_summary_values(label_text, source_map)
             if not values:
                 continue
             candidate = values[0].strip()
             if not candidate:
                 continue
-            row.cells[1].text = candidate
+            row_cells[1].text = candidate
 
     def _apply_grouped_postal_address_placeholders(self, table, source_map: dict[str, list[str]]) -> None:
         self._apply_grouped_placeholder_block(
@@ -167,9 +178,10 @@ class QisDocxFiller:
 
         label_to_row: dict[str, int] = {}
         for row_index, row in enumerate(table.rows):
-            if not row.cells:
+            row_cells = self._row_cells(row)
+            if not row_cells:
                 continue
-            row_label_key = self._normalize_label(row.cells[0].text)
+            row_label_key = self._normalize_label(row_cells[0].text)
             if row_label_key and row_label_key not in label_to_row:
                 label_to_row[row_label_key] = row_index
 
@@ -193,16 +205,18 @@ class QisDocxFiller:
         if start_row == end_row:
             return
 
-        if len(table.rows[start_row].cells) < 2:
+        start_row_cells = self._row_cells(table.rows[start_row])
+        if len(start_row_cells) < 2:
             return
 
         # Clear existing values in the grouped range before merging.
         for row_index in row_indices:
             row = table.rows[row_index]
-            for col_index in range(1, len(row.cells)):
-                row.cells[col_index].text = ""
+            row_cells = self._row_cells(row)
+            for col_index in range(1, len(row_cells)):
+                row_cells[col_index].text = ""
 
-        for col_index in range(1, len(table.rows[start_row].cells)):
+        for col_index in range(1, len(start_row_cells)):
             try:
                 table.cell(start_row, col_index).merge(table.cell(end_row, col_index))
             except Exception:
@@ -227,9 +241,10 @@ class QisDocxFiller:
         if row_index >= len(table.rows):
             return
         row = table.rows[row_index]
-        if col_index >= len(row.cells):
+        row_cells = QisDocxFiller._row_cells(row)
+        if col_index >= len(row_cells):
             return
-        row.cells[col_index].text = value
+        row_cells[col_index].text = value
 
     def _fill_manufacture_section(self, doc: Document, info: ManufactureInfo) -> bool:
         heading_index = None
@@ -266,7 +281,8 @@ class QisDocxFiller:
         for table in doc.tables:
             if len(table.columns) != 4 or len(table.rows) < 2:
                 continue
-            header = " ".join(cell.text.strip().lower() for cell in table.rows[0].cells)
+            header_cells = QisDocxFiller._row_cells(table.rows[0])
+            header = " ".join(cell.text.strip().lower() for cell in header_cells)
             if "name and address" in header and "api-pq" in header and "letter of access" in header:
                 return table
         return None
@@ -297,8 +313,11 @@ class QisDocxFiller:
         for table in doc.tables:
             if len(table.columns) != 2 or len(table.rows) < 2:
                 continue
-            header_left = table.rows[0].cells[0].text.strip().lower()
-            header_right = table.rows[0].cells[1].text.strip().lower()
+            header_cells = self._row_cells(table.rows[0])
+            if len(header_cells) < 2:
+                continue
+            header_left = header_cells[0].text.strip().lower()
+            header_right = header_cells[1].text.strip().lower()
             if "name and address" in header_left and "responsibility" in header_right:
                 target_table = table
                 break
@@ -321,31 +340,36 @@ class QisDocxFiller:
 
         for ti, table in enumerate(doc.tables):
             for ri, row in enumerate(table.rows):
-                row_text = " ".join(cell.text.strip() for cell in row.cells).lower()
+                row_cells = self._row_cells(row)
+                if not row_cells:
+                    continue
+                row_text = " ".join(cell.text.strip() for cell in row_cells).lower()
 
                 if "name of api" in row_text:
-                    target_cell = row.cells[-1]
+                    target_cell = row_cells[-1]
                     target_cell.text = api_info.api_name
                     found_api = True
 
                 if "name of api manufacturer" in row_text:
-                    target_cell = row.cells[-1]
+                    target_cell = row_cells[-1]
                     target_cell.text = api_info.manufacturer_text
                     found_mfr = True
 
                 if "full details in the pd" in row_text:
                     full_details_row = (ti, ri)
 
-                if "confirmation of api prequalification document" in row_text and row.cells:
-                    row.cells[0].text = "□"
-                if "certificate of suitability to the european pharmacopoeia" in row_text and row.cells:
-                    row.cells[0].text = "□"
-                if "active pharmaceutical ingredient master file" in row_text and row.cells:
-                    row.cells[0].text = "□"
+                if "confirmation of api prequalification document" in row_text and row_cells:
+                    row_cells[0].text = "□"
+                if "certificate of suitability to the european pharmacopoeia" in row_text and row_cells:
+                    row_cells[0].text = "□"
+                if "active pharmaceutical ingredient master file" in row_text and row_cells:
+                    row_cells[0].text = "□"
 
         if full_details_row is not None:
             ti, ri = full_details_row
-            doc.tables[ti].rows[ri].cells[0].text = "√"
+            chosen_row_cells = self._row_cells(doc.tables[ti].rows[ri])
+            if chosen_row_cells:
+                chosen_row_cells[0].text = "√"
 
         return found_api and found_mfr
 
