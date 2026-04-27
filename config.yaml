@@ -1,13 +1,13 @@
-template_docx_path:    "C:\\Users\\exill\\OneDrive - Exillar\\Desktop\\Projects\\JB Pharma\\Tagging- mapping logic\\Tagging- mapping logic\\QUALITY INFORMATION SUMMARY.docx"
+template_docx_path:    "D:\\JB Pharma internal\\JB Pharma\\Tagging- mapping logic\\Tagging- mapping logic\\QUALITY INFORMATION SUMMARY.docx"
 mapping_logic_pdf_path: ""
-source_pdf_folder:     "C:\\Users\\exill\\OneDrive - Exillar\\Desktop\\Projects\\JB Pharma\\Cardiolek\\Module 3\\32-Body-Data"
-output_docx_path:      "C:\\Users\\exill\\OneDrive - Exillar\\Desktop\\Projects\\JB Pharma\\Cardiolek\\Output\\Output_QIS.docx"
-log_folder:            "C:\\Users\\exill\\OneDrive - Exillar\\Desktop\\Projects\\JB Pharma\\Cardiolek\\Output\\logger"
+source_pdf_folder:     "D:\\JB Pharma internal\\JB Pharma\\Cardiolek\\"
+output_docx_path:      "D:\\JB Pharma internal\\JB Pharma\\Cardiolek\\Output\\Cardiolek_QIS.docx"
+log_folder:            "D:\\JB Pharma internal\\JB Pharma\\Cardiolek\\Output\\logger"
 
 # Unified mode options
 # Runs table-driven QIS v2 overlay after legacy placeholder filling.
 enable_qis_v2_overlay: true
-# Disable legacy pdf2docx table injection to avoid random line artifacts.
+# Disable legacy pdf2docx table  injection to avoid random line artifacts.
 include_pdf_tables: false
 # Optional: set dossier root explicitly (contains Module 1 + Module 3).
 # Leave empty to auto-derive from source_pdf_folder.
