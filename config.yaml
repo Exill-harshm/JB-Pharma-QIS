@@ -1,7 +1,7 @@
 template_docx_path:    "D:\\JB Pharma internal\\JB Pharma\\Tagging- mapping logic\\Tagging- mapping logic\\QUALITY INFORMATION SUMMARY.docx"
 mapping_logic_pdf_path: ""
 source_pdf_folder:     "D:\\JB Pharma internal\\JB Pharma\\Cardiolek\\"
-output_docx_path:      "D:\\JB Pharma internal\\JB Pharma\\Cardiolek\\Output\\Cardiolek_QIS.docx"
+output_docx_path:      "D:\\JB Pharma internal\\JB Pharma\\Cardiolek\\Output_QIS.docx"
 log_folder:            "D:\\JB Pharma internal\\JB Pharma\\Cardiolek\\Output\\logger"
 
 # Unified mode options
@@ -31,6 +31,7 @@ section_page_limits:
 # For these sections, inject only table elements from extracted content.
 table_only_sections:
   - "3.2.S.4.1"
+  - "3.2.P.3.4"
 
 # Set true to inject only tables for ALL sections/PDFs.
 table_only_all_sections: false
@@ -40,3 +41,4 @@ table_only_all_sections: false
 # section can vary medicine-to-medicine.
 table_keyword_by_template_section:
   "2.3.S.4.1": "Specification"
+  "2.3.P.3.4": "Process stage"
