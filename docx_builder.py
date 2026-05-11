@@ -2342,7 +2342,7 @@ def _append_rows_as_table(doc, current_anchor, headers, rows, force_new_table=Fa
 
     # Drop duplicates already present in reference table by first-column key.
     filtered_rows = rows[:]
-    if reference_table is not None:
+    if reference_table is not None and not force_new_table:
         existing_first_col = set()
         for r_idx, r in enumerate(reference_table.rows):
             if r_idx == 0:
